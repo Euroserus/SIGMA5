@@ -5,9 +5,17 @@
 A fast, lightweight launcher for Windows, built in Rust on raw Win32.
 
 - **Instant:** the window is created once and shown/hidden on the hotkey (opens in ~10 ms).
-- **Tiny:** ~0.5 MB executable, ~14 MB private memory, no web view, no GPU framework, no runtime.
+- **Tiny:** < 1 MB executable, ~13 MB private memory, no web view, no GPU framework, no runtime.
 - **Finds everything the Start menu does:** classic desktop apps *and* Microsoft Store apps, with their real icons.
 - **Smart ranking:** fuzzy matching ("vsc" → Visual Studio Code, "sw" → SOLIDWORKS) plus frecency, so the apps you use most float to the top.
+
+## Install
+
+1. Download `sigma5.exe` from the [latest release](../../releases/latest). It's a single file; nothing else to install.
+2. Put it somewhere permanent, e.g. `%LOCALAPPDATA%\SIGMA5\sigma5.exe`, and run it.
+3. Press `Alt+Space`. Open Settings with `Ctrl+,` to turn on *Launch at login*, change the hotkey, and so on.
+
+The exe isn't code-signed, so Windows SmartScreen may say "Windows protected your PC" the first time. Click **More info → Run anyway**. Requires Windows 10 or 11 (64-bit).
 
 ## Usage
 
@@ -165,3 +173,7 @@ The UI renders any `Item` (title, subtitle, accessory label, app icon or Fluent 
 - [ ] Actions panel (`Ctrl+K`): run as admin, open file location, copy path
 - [x] Calculator / unit conversions with dimensional analysis
 - [ ] Windows settings pages & system commands (lock, sleep, restart)
+
+## License
+
+[MIT](LICENSE) © 2026 Nathan Smith
