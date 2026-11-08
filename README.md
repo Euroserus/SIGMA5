@@ -4,7 +4,7 @@
 
 **A fast launcher for engineers on Windows.** Open CAD, simulation and coding tools in a keystroke, do unit-aware maths without reaching for a calculator, and keep your machine's software up to date, all from one small window.
 
-Built by a Mechanical Engineering student for engineering students. Raycast-style, but written in Rust on raw Win32: no web view, no runtime, a ~1 MB exe, ~13 MB of RAM, and it opens in ~10 ms.
+Built by a Mechanical Engineering student, for engineering students. Raycast-style, but written in Rust on raw Win32: no web view, no runtime, a ~1 MB exe, ~13 MB of RAM, and it opens in ~10 ms.
 
 ### Why engineers use it
 
