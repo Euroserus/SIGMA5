@@ -35,6 +35,10 @@ $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
 Write-Host "sigma5.exe  $([math]::Round((Get-Item $exe).Length / 1KB)) KB  sha256 $hash"
 if ($DryRun) { Write-Host "Dry run: not publishing."; return }
 
+# Publish only once main is on GitHub, so the release tag gets this commit.
 git push
-gh release create $tag $exe --target main --title $title --notes-file $Notes
+if ($LASTEXITCODE) { throw "git push failed (pull or rebase first). Nothing was published." }
+$head = git rev-parse HEAD
+gh release create $tag $exe --target $head --title $title --notes-file $Notes
+if ($LASTEXITCODE) { throw "gh release create failed." }
 Write-Host "Published. Installed copies will offer the update within 12 hours (or via 'Check for Updates')."

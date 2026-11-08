@@ -2,7 +2,9 @@
 //!
 //! - **Check:** one HTTPS request to the GitHub Releases API (WinHTTP, built
 //!   into Windows, so no TLS library is bundled). Runs on a short-lived thread.
-//! - **Download:** the release's `sigma5.exe` into `%LOCALAPPDATA%\SIGMA5\updates`.
+//! - **Download:** the release's `sigma5.exe` into `%LOCALAPPDATA%\SIGMA5\updates`,
+//!   through the API's asset endpoint. The github.com download link is only a
+//!   fallback: it has been seen returning HTTP 504 while the API worked.
 //! - **Verify:** SHA-256 (Windows BCrypt) must match the digest GitHub publishes
 //!   for the asset; otherwise the file is deleted and nothing runs.
 //! - **Apply:** the new exe's built-in installer (`--install`) stops this copy,
@@ -28,6 +30,8 @@ pub struct UpdateInfo {
     /// e.g. "Bernoulli" (from the release title "SIGMA5 0.3.0 “Bernoulli”").
     pub codename: String,
     pub download_url: String,
+    /// The same file through the API (`api.github.com/.../releases/assets/<id>`).
+    pub api_url: String,
     /// Hex SHA-256 published by GitHub for the asset.
     pub sha256: String,
     pub size: u64,
@@ -61,6 +65,9 @@ struct ApiRelease {
 struct ApiAsset {
     name: String,
     browser_download_url: String,
+    /// API endpoint for the asset; serves the file with `Accept: application/octet-stream`.
+    #[serde(default)]
+    url: String,
     #[serde(default)]
     digest: Option<String>,
     #[serde(default)]
@@ -102,6 +109,7 @@ pub fn parse_latest(json: &str, current: &str) -> Result<Option<UpdateInfo>, Str
         codename: codename_from_title(r.name.as_deref().unwrap_or("")),
         version,
         download_url: asset.browser_download_url.clone(),
+        api_url: asset.url.clone(),
         sha256,
         size: asset.size,
         page_url: r.html_url,
@@ -219,8 +227,25 @@ pub fn updates_dir() -> PathBuf {
 }
 
 /// Downloads and verifies the update. Returns the verified exe's path.
-pub fn download(info: &UpdateInfo, progress: impl FnMut(u64, u64)) -> Result<PathBuf, String> {
-    let data = https_get(&info.download_url, "application/octet-stream", progress)?;
+pub fn download(info: &UpdateInfo, mut progress: impl FnMut(u64, u64)) -> Result<PathBuf, String> {
+    // The API endpoint first, then the github.com link; report the first error.
+    let mut data = None;
+    let mut first_err = None;
+    for url in [&info.api_url, &info.download_url] {
+        if !url.starts_with("https://") {
+            continue;
+        }
+        match https_get(url, "application/octet-stream", &mut progress) {
+            Ok(d) => {
+                data = Some(d);
+                break;
+            }
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    let data = data.ok_or_else(|| first_err.unwrap_or_else(|| "The new release has no download link".into()))?;
     if sha256_hex(&data) != info.sha256 {
         return Err("The download didn't match its published checksum, so it wasn't installed".into());
     }
@@ -256,6 +281,7 @@ mod tests {
         "assets": [
             {"name": "notes.txt", "browser_download_url": "https://e/notes", "size": 1},
             {"name": "sigma5.exe", "browser_download_url": "https://github.com/x/y/releases/download/v0.3.0/sigma5.exe",
+             "url": "https://api.github.com/repos/x/y/releases/assets/42",
              "digest": "sha256:16588b36f770f28b39ec880a68234b789503b48f3e930e30318b0b3085fd76b5", "size": 784896}
         ]
     }"#;
@@ -267,6 +293,7 @@ mod tests {
         assert_eq!(u.codename, "Bernoulli");
         assert_eq!(u.label(), "0.3.0 “Bernoulli”");
         assert!(u.download_url.ends_with("/sigma5.exe"));
+        assert_eq!(u.api_url, "https://api.github.com/repos/x/y/releases/assets/42");
         assert_eq!(u.sha256.len(), 64);
     }
 

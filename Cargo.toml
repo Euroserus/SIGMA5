@@ -1,6 +1,6 @@
 [package]
 name = "sigma5"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "SIGMA5 (S5) - a fast, lightweight launcher for Windows"
 build = "build.rs"
