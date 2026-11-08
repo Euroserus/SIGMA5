@@ -45,6 +45,32 @@ fn try_font(px: i32, weight: i32, face: &str) -> Option<HFONT> {
     }
 }
 
+/// Every installed font family, sorted (vertical "@" variants skipped).
+pub fn font_families() -> Vec<String> {
+    unsafe extern "system" fn each(lf: *const LOGFONTW, _: *const TEXTMETRICW, _: u32, out: windows::Win32::Foundation::LPARAM) -> i32 {
+        unsafe {
+            let face = &(*lf).lfFaceName;
+            let n = face.iter().position(|&c| c == 0).unwrap_or(face.len());
+            let name = String::from_utf16_lossy(&face[..n]);
+            let list = &mut *(out.0 as *mut Vec<String>);
+            if !name.starts_with('@') && !name.is_empty() {
+                list.push(name);
+            }
+        }
+        1
+    }
+    let mut list: Vec<String> = Vec::new();
+    unsafe {
+        let hdc = GetDC(None);
+        let lf = LOGFONTW { lfCharSet: DEFAULT_CHARSET, ..Default::default() };
+        EnumFontFamiliesExW(hdc, &lf, Some(each), windows::Win32::Foundation::LPARAM(&mut list as *mut _ as isize), 0);
+        ReleaseDC(None, hdc);
+    }
+    list.sort_by_key(|s| s.to_lowercase());
+    list.dedup();
+    list
+}
+
 /// Creates a font from the first installed face in `faces`.
 pub fn font(px: i32, weight: i32, faces: &[&str]) -> HFONT {
     faces
@@ -65,6 +91,33 @@ pub fn delete_fonts(fonts: &[HFONT]) {
             }
         }
     }
+}
+
+/// Font faces to try: a custom family first (if set), then the defaults.
+pub fn faces<'a>(custom: &'a str, defaults: &[&'a str]) -> Vec<&'a str> {
+    let mut v = Vec::with_capacity(defaults.len() + 1);
+    if !custom.trim().is_empty() {
+        v.push(custom.trim());
+    }
+    v.extend_from_slice(defaults);
+    v
+}
+
+// ----- corner style ---------------------------------------------------------------
+
+thread_local! {
+    /// Largest corner radius any shape may use (physical px). Each window sets
+    /// it from the theme before painting; 0 makes everything square.
+    static CORNER_CAP: std::cell::Cell<i32> = const { std::cell::Cell::new(i32::MAX) };
+}
+
+/// Sets the corner cap for shapes drawn on this thread.
+pub fn set_corner_cap(px: i32) {
+    CORNER_CAP.with(|c| c.set(px.max(0)));
+}
+
+pub fn corner_cap() -> i32 {
+    CORNER_CAP.with(|c| c.get())
 }
 
 // ----- back buffer ------------------------------------------------------------
@@ -147,6 +200,12 @@ pub fn round_rect(hdc: HDC, rc: &RECT, radius: i32, color: COLORREF) {
     let w = rc.right - rc.left;
     let h = rc.bottom - rc.top;
     if w <= 0 || h <= 0 {
+        return;
+    }
+    let radius = radius.min(corner_cap());
+    if radius <= 0 {
+        // Square corners: a plain fill, no per-pixel work.
+        fill(hdc, rc, color);
         return;
     }
     let r = (radius as f32).min(w as f32 / 2.0).min(h as f32 / 2.0).max(0.0);
@@ -250,4 +309,60 @@ pub fn text_width(hdc: HDC, s: &str, font: HFONT) -> i32 {
         SelectObject(hdc, old);
     }
     sz.cx
+}
+
+// ----- test helpers -------------------------------------------------------------
+
+/// Writes 0x00RRGGBB pixels as an uncompressed PNG, each pixel `zoom` px square.
+#[cfg(test)]
+pub fn write_png(path: &str, px: &[u32], w: usize, h: usize, zoom: usize) {
+    fn crc(data: &[u8]) -> u32 {
+        let mut c = !0u32;
+        for &b in data {
+            c ^= b as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+        }
+        !c
+    }
+    fn chunk(out: &mut Vec<u8>, kind: &[u8], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let mut body = kind.to_vec();
+        body.extend_from_slice(data);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc(&body).to_be_bytes());
+    }
+    let (zw, zh) = (w * zoom, h * zoom);
+    let mut raw = Vec::with_capacity((zw * 3 + 1) * zh);
+    for y in 0..zh {
+        raw.push(0);
+        for x in 0..zw {
+            let p = px[(y / zoom) * w + x / zoom];
+            raw.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8]);
+        }
+    }
+    let mut z = vec![0x78, 0x01];
+    let blocks: Vec<&[u8]> = raw.chunks(65_535).collect();
+    for (i, b) in blocks.iter().enumerate() {
+        z.push((i + 1 == blocks.len()) as u8);
+        z.extend_from_slice(&(b.len() as u16).to_le_bytes());
+        z.extend_from_slice(&(!(b.len() as u16)).to_le_bytes());
+        z.extend_from_slice(b);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in &raw {
+        a = (a + x as u32) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    z.extend_from_slice(&(b << 16 | a).to_be_bytes());
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&(zw as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(zh as u32).to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    chunk(&mut out, b"IHDR", &ihdr);
+    chunk(&mut out, b"IDAT", &z);
+    chunk(&mut out, b"IEND", &[]);
+    std::fs::write(path, out).unwrap();
 }

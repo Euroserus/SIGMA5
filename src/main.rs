@@ -13,7 +13,9 @@
 
 mod calc;
 mod clipboard;
+mod colors;
 mod config;
+mod files;
 mod focus;
 mod fuzzy;
 mod history;
@@ -21,6 +23,7 @@ mod install;
 mod keys;
 mod launch;
 mod providers;
+mod sysinfo;
 mod ui;
 mod update;
 mod util;

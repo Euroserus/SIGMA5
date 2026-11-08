@@ -110,6 +110,118 @@ impl ThemeMode {
     }
 }
 
+/// Look and feel beyond theme/accent/size.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct Appearance {
+    /// Corner radius in px; 0 = square.
+    pub corner_radius: u32,
+    /// Interface font family ("" = Segoe UI Variable).
+    pub font: String,
+    /// Search box font family ("" = Segoe UI Variable Display).
+    pub search_font: String,
+    /// Text size, percent.
+    pub font_scale: u32,
+    /// Launcher width and height (px at 100% scaling), and result row height.
+    pub width: u32,
+    pub height: u32,
+    pub row_height: u32,
+    /// Colour overrides as "#RRGGBB" ("" = from the theme).
+    pub background: String,
+    pub text: String,
+    pub subtext: String,
+    pub selection: String,
+    pub border: String,
+    /// Custom accent; overrides the accent preset when set.
+    pub accent_color: String,
+    /// Border drawn round the launcher: thickness in px (0 = none) and
+    /// colour ("" = the accent).
+    pub window_border: u32,
+    pub window_border_color: String,
+    /// Small animations (selection glide, pulses, pixel dissolves).
+    pub animations: bool,
+}
+
+pub const RADIUS_STEPS: &[u32] = &[0, 2, 4, 6, 8, 12, 16];
+pub const FONT_SCALE: (u32, u32, u32) = (80, 140, 5);
+pub const WIDTH: (u32, u32, u32) = (600, 1100, 25);
+pub const HEIGHT: (u32, u32, u32) = (360, 760, 20);
+pub const ROW_HEIGHT: (u32, u32, u32) = (34, 60, 2);
+pub const BORDER: (u32, u32, u32) = (0, 8, 1);
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            corner_radius: 0,
+            font: String::new(),
+            search_font: String::new(),
+            font_scale: 100,
+            width: 750,
+            height: 474,
+            row_height: 44,
+            background: String::new(),
+            text: String::new(),
+            subtext: String::new(),
+            selection: String::new(),
+            border: String::new(),
+            accent_color: String::new(),
+            window_border: 2,
+            window_border_color: String::new(),
+            animations: true,
+        }
+    }
+}
+
+impl Appearance {
+    /// Values clamped to the supported ranges (hand-edited files may be off).
+    pub fn sane(&self) -> Self {
+        let clamp = |v: u32, (lo, hi, _): (u32, u32, u32)| v.clamp(lo, hi);
+        Self {
+            corner_radius: self.corner_radius.min(16),
+            font_scale: clamp(self.font_scale, FONT_SCALE),
+            width: clamp(self.width, WIDTH),
+            height: clamp(self.height, HEIGHT),
+            row_height: clamp(self.row_height, ROW_HEIGHT),
+            window_border: clamp(self.window_border, BORDER),
+            ..self.clone()
+        }
+    }
+
+    fn to_toml(&self) -> String {
+        format!(
+            "\n# Appearance. Colours are \"#RRGGBB\" (\"\" = from the theme); fonts are family names\n\
+             # (\"\" = Segoe UI Variable). corner_radius 0 = square.\n\
+             [appearance]\ncorner_radius = {}\nfont = {:?}\nsearch_font = {:?}\nfont_scale = {}\nwidth = {}\nheight = {}\n\
+             row_height = {}\nbackground = {:?}\ntext = {:?}\nsubtext = {:?}\nselection = {:?}\nborder = {:?}\n\
+             accent_color = {:?}\nwindow_border = {}\nwindow_border_color = {:?}\nanimations = {}\n",
+            self.corner_radius, self.font, self.search_font, self.font_scale, self.width, self.height, self.row_height,
+            self.background, self.text, self.subtext, self.selection, self.border, self.accent_color, self.window_border,
+            self.window_border_color, self.animations
+        )
+    }
+}
+
+/// The bar above the search box (the "topbar" module).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct TopBar {
+    /// Component ids, left to right (see `sysinfo::ITEMS`).
+    pub items: Vec<String>,
+    /// 24-hour clock (otherwise 12-hour with AM/PM).
+    pub clock_24h: bool,
+    pub show_seconds: bool,
+}
+
+impl Default for TopBar {
+    fn default() -> Self {
+        Self {
+            items: ["clock", "date", "cpu", "ram", "gpu", "battery"].map(String::from).to_vec(),
+            clock_24h: true,
+            show_seconds: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -130,12 +242,18 @@ pub struct Config {
     pub keep_query_secs: u64,
     /// Number of recently used items shown when the search box is empty.
     pub recent_count: usize,
-    /// Provider ids that are turned off (see `providers::EXTENSIONS`).
-    pub disabled_extensions: Vec<String>,
+    /// Module ids that are turned off (see `providers::MODULES`).
+    /// Older configs called these extensions.
+    #[serde(alias = "disabled_extensions")]
+    pub disabled_modules: Vec<String>,
+    /// Extra folders for File Search, on top of the user folder (e.g. "D:\\").
+    pub file_folders: Vec<String>,
     /// What Caps Lock does.
     pub caps_lock: CapsMode,
     pub app_hotkeys: Vec<AppHotkey>,
     pub remaps: Vec<Remap>,
+    pub top_bar: TopBar,
+    pub appearance: Appearance,
 }
 
 impl Default for Config {
@@ -151,17 +269,20 @@ impl Default for Config {
             auto_update: true,
             keep_query_secs: 30,
             recent_count: 6,
-            disabled_extensions: Vec::new(),
+            disabled_modules: Vec::new(),
+            file_folders: Vec::new(),
             caps_lock: CapsMode::Default,
             app_hotkeys: Vec::new(),
             remaps: Vec::new(),
+            top_bar: TopBar::default(),
+            appearance: Appearance::default(),
         }
     }
 }
 
 impl Config {
-    pub fn extension_enabled(&self, id: &str) -> bool {
-        !self.disabled_extensions.iter().any(|d| d == id)
+    pub fn module_enabled(&self, id: &str) -> bool {
+        !self.disabled_modules.iter().any(|d| d == id)
     }
 
     /// Effective key remaps as (source key code, target). Caps Lock's own
@@ -187,6 +308,16 @@ impl Config {
             "\n# Caps Lock: \"default\", \"hyper\" (Ctrl+Shift+Alt), \"ctrl\", \"escape\" or \"off\"\n",
         );
         out.push_str(&format!("caps_lock = \"{}\"\n", self.caps_lock.as_str()));
+        let items: Vec<String> = self.top_bar.items.iter().map(|i| format!("{i:?}")).collect();
+        out.push_str(&format!(
+            "\n# Top bar (the \"topbar\" module), left to right. Components: clock, date, cpu, ram,\n\
+             # gpu, cpu_temp, gpu_temp, battery, net, disk.\n\
+             [top_bar]\nitems = [{}]\nclock_24h = {}\nshow_seconds = {}\n",
+            items.join(", "),
+            self.top_bar.clock_24h,
+            self.top_bar.show_seconds
+        ));
+        out.push_str(&self.appearance.to_toml());
         out.push_str(
             "\n# App hotkeys: focus the app if it's running (press again to cycle its windows),\n\
              # otherwise launch it. `app` is the app's id from the Start menu's app list.\n",
@@ -211,7 +342,8 @@ impl Config {
 
     fn base_toml(&self) -> String {
         let accents: Vec<&str> = Accent::ALL.iter().map(|a| a.as_str()).collect();
-        let disabled: Vec<String> = self.disabled_extensions.iter().map(|d| format!("{d:?}")).collect();
+        let disabled: Vec<String> = self.disabled_modules.iter().map(|d| format!("{d:?}")).collect();
+        let folders: Vec<String> = self.file_folders.iter().map(|d| format!("{d:?}")).collect();
         format!(
             r#"# SIGMA5 settings. Easiest to change from SIGMA5 Settings (Ctrl+, in the launcher);
 # edits here also work and apply the next time the launcher opens.
@@ -247,8 +379,11 @@ keep_query_secs = {kq}
 # How many recently used items to show when the search box is empty.
 recent_count = {rc}
 
-# Extensions to turn off, e.g. ["commands"]
-disabled_extensions = [{disabled}]
+# Modules to turn off, e.g. ["commands", "files"]
+disabled_modules = [{disabled}]
+
+# File Search indexes your user folder. Add more folders here, e.g. ["D:\Uni"].
+file_folders = [{folders}]
 "#,
             hotkey = self.hotkey,
             clip_hotkey = self.clipboard_hotkey,
@@ -262,6 +397,7 @@ disabled_extensions = [{disabled}]
             kq = self.keep_query_secs,
             rc = self.recent_count,
             disabled = disabled.join(", "),
+            folders = folders.join(", "),
         )
     }
 }
@@ -355,8 +491,22 @@ mod tests {
         c.auto_update = false;
         c.keep_query_secs = 120;
         c.recent_count = 3;
-        c.disabled_extensions = vec!["commands".into()];
+        c.disabled_modules = vec!["commands".into()];
+        c.file_folders = vec![r"D:\Uni Work".into()];
         c.caps_lock = CapsMode::Hyper;
+        c.top_bar = TopBar { items: vec!["net".into(), "clock".into()], clock_24h: false, show_seconds: true };
+        c.appearance = Appearance {
+            corner_radius: 6,
+            font: "Bahnschrift".into(),
+            font_scale: 110,
+            width: 900,
+            background: "#101418".into(),
+            accent_color: "#FF8800".into(),
+            window_border: 4,
+            window_border_color: "#00FF00".into(),
+            animations: false,
+            ..Appearance::default()
+        };
         c.app_hotkeys = vec![
             AppHotkey { hotkey: "Ctrl+Alt+Shift+C".into(), app: "Chrome".into(), name: "Google Chrome".into() },
             AppHotkey {
@@ -387,6 +537,13 @@ mod tests {
         assert_eq!(rules, vec![(keys::VK_CAPITAL, Target::HYPER), (0x68, Target::Keys { mods: 0, key: Some(0xAF) })]);
         c.caps_lock = CapsMode::Default;
         assert_eq!(c.key_rules()[0], (keys::VK_CAPITAL, Target::Keys { mods: 0, key: Some(0x1B) }));
+    }
+
+    #[test]
+    fn old_extension_list_still_loads() {
+        let c: Config = toml::from_str("disabled_extensions = [\"winget\"]").unwrap();
+        assert!(!c.module_enabled("winget"));
+        assert!(c.module_enabled("apps"));
     }
 
     #[test]

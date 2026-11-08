@@ -63,6 +63,27 @@ pub fn open_url(url: &str) {
     });
 }
 
+/// Opens a WhatsApp chat with `phone` (international digits, no +) and
+/// `text` typed in: the WhatsApp app if installed, else wa.me in the browser.
+pub fn open_whatsapp(phone: &str, text: &str) {
+    let q = crate::util::url_encode(text);
+    let app = format!("whatsapp://send?phone={phone}&text={q}");
+    let web = format!("https://wa.me/{phone}?text={q}");
+    spawn_shell(move || {
+        if !shell_execute(&app, None) {
+            shell_execute(&web, None);
+        }
+    });
+}
+
+/// Opens Explorer with `path` selected.
+pub fn reveal(path: &std::path::Path) {
+    let p = path.to_string_lossy().to_string();
+    spawn_shell(move || {
+        shell_execute("explorer.exe", Some(&format!("/select,\"{p}\"")));
+    });
+}
+
 pub fn open_folder(path: &std::path::Path) {
     let p = path.to_string_lossy().to_string();
     spawn_shell(move || {
@@ -79,6 +100,9 @@ const APPROVED_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\E
 /// Adds or removes SIGMA5's own startup entry (HKCU\...\Run plus its
 /// "startup approved" record).
 pub fn set_start_with_windows(enabled: bool) {
+    if crate::ui::headless() {
+        return;
+    }
     unsafe {
         if enabled {
             // Prefer the installed copy, so a dev/portable build never

@@ -29,21 +29,26 @@ pub struct Fonts {
 }
 
 impl Fonts {
-    /// `dpi` is the effective DPI (monitor DPI × launcher size).
-    pub fn create(dpi: u32) -> Self {
+    /// `dpi` is the effective DPI (monitor DPI × launcher size); fonts and
+    /// text size follow the Appearance settings.
+    pub fn create(dpi: u32, look: &crate::config::Appearance) -> Self {
+        let scale = look.sane().font_scale as i32;
         let s = |v: i32| (v * dpi as i32 + 48) / 96;
+        let t = |v: i32| s(v * scale / 100);
+        let ui = draw::faces(&look.font, UI_FACES);
+        let display = draw::faces(if look.search_font.trim().is_empty() { &look.font } else { &look.search_font }, DISPLAY_FACES);
         Self {
-            search: draw::font(s(19), 400, DISPLAY_FACES),
-            title: draw::font(s(14), 400, UI_FACES),
-            small: draw::font(s(13), 400, UI_FACES),
-            header: draw::font(s(12), 600, UI_FACES),
+            search: draw::font(t(19), 400, &display),
+            title: draw::font(t(14), 400, &ui),
+            small: draw::font(t(13), 400, &ui),
+            header: draw::font(t(12), 600, &ui),
             glyph: draw::font(s(15), 400, ICON_FACES),
             kbd_glyph: draw::font(s(11), 400, ICON_FACES),
-            letter: draw::font(s(13), 600, UI_FACES),
-            calc_big: draw::font(s(30), 600, DISPLAY_FACES),
-            calc_expr: draw::font(s(19), 400, DISPLAY_FACES),
+            letter: draw::font(t(13), 600, &ui),
+            calc_big: draw::font(t(30), 600, &display),
+            calc_expr: draw::font(t(19), 400, &display),
             calc_glyph: draw::font(s(12), 400, ICON_FACES),
-            mono: draw::font(s(13), 400, &["Cascadia Mono", "Consolas"]),
+            mono: draw::font(t(13), 400, &["Cascadia Mono", "Consolas"]),
         }
     }
 
@@ -71,14 +76,18 @@ pub fn paint(ui: &mut Launcher) {
     }
 }
 
-fn draw(ui: &Launcher, dc: HDC, w: i32, h: i32) {
+pub(crate) fn draw(ui: &Launcher, dc: HDC, w: i32, h: i32) {
     let t: &Theme = &ui.theme;
+    draw::set_corner_cap(ui.s(t.radius));
     fill(dc, &RECT { left: 0, top: 0, right: w, bottom: h }, t.bg);
 
     let search_h = ui.s(m::SEARCH_H);
     let footer_h = ui.s(m::FOOTER_H);
-    fill(dc, &RECT { left: 0, top: search_h, right: w, bottom: search_h + 1 }, t.divider);
+    let bar_top = ui.top_h();
+    fill(dc, &RECT { left: 0, top: bar_top + search_h, right: w, bottom: bar_top + search_h + 1 }, t.divider);
     fill(dc, &RECT { left: 0, top: h - footer_h - 1, right: w, bottom: h - footer_h }, t.divider);
+
+    draw_top_bar(ui, dc, w);
 
     // Sub-pages: back arrow (left) and page title chip (right) in the search bar.
     if let Some(back) = ui.back_rect() {
@@ -86,7 +95,7 @@ fn draw(ui: &Launcher, dc: HDC, w: i32, h: i32) {
         let title = ui.mode.title();
         let tw = text_width(dc, title, ui.fonts.header);
         let ch = ui.s(24);
-        let cy = search_h / 2;
+        let cy = bar_top + search_h / 2;
         let chip = RECT { left: w - ui.s(18) - tw - ui.s(20), top: cy - ch / 2, right: w - ui.s(18), bottom: cy - ch / 2 + ch };
         round_rect(dc, &chip, ui.s(6), t.kbd_bg);
         text(dc, title, &chip, ui.fonts.header, t.kbd_text, DT_CENTER);
@@ -97,6 +106,110 @@ fn draw(ui: &Launcher, dc: HDC, w: i32, h: i32) {
         draw_clip_preview(ui, dc);
     }
     draw_footer(ui, dc, w, h);
+    draw_frame(dc, w, h, ui.s(t.frame_w).max(t.frame_w.min(1)), t.frame);
+}
+
+/// The coloured border round the whole window.
+pub fn draw_frame(dc: HDC, w: i32, h: i32, px: i32, c: windows::Win32::Foundation::COLORREF) {
+    if px <= 0 {
+        return;
+    }
+    fill(dc, &RECT { left: 0, top: 0, right: w, bottom: px }, c);
+    fill(dc, &RECT { left: 0, top: h - px, right: w, bottom: h }, c);
+    fill(dc, &RECT { left: 0, top: 0, right: px, bottom: h }, c);
+    fill(dc, &RECT { left: w - px, top: 0, right: w, bottom: h }, c);
+}
+
+/// One top bar component: (glyph, label, value, meter fraction).
+fn top_item(ui: &Launcher, id: &str, tb: &crate::config::TopBar) -> Option<(char, &'static str, String, Option<f32>)> {
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    let info = crate::sysinfo::item(id)?;
+    let si = &ui.sysinfo;
+    let dash = || "—".to_string();
+    let pct = |v: Option<f32>| v.map_or_else(dash, |p| format!("{p:.0}%"));
+    let deg = |v: Option<f32>| v.map_or_else(dash, |c| format!("{c:.0}°C"));
+    Some(match id {
+        "clock" | "date" => {
+            let t = unsafe { GetLocalTime() };
+            if id == "date" {
+                const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+                const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+                let d = format!("{} {} {}", DAYS[t.wDayOfWeek as usize % 7], t.wDay, MONTHS[(t.wMonth as usize).clamp(1, 12) - 1]);
+                (info.glyph, "", d, None)
+            } else {
+                let secs = if tb.show_seconds { format!(":{:02}", t.wSecond) } else { String::new() };
+                let s = if tb.clock_24h {
+                    format!("{:02}:{:02}{secs}", t.wHour, t.wMinute)
+                } else {
+                    let h = match t.wHour % 12 { 0 => 12, h => h };
+                    format!("{h}:{:02}{secs} {}", t.wMinute, if t.wHour < 12 { "AM" } else { "PM" })
+                };
+                (info.glyph, "", s, None)
+            }
+        }
+        "cpu" => (info.glyph, "CPU", pct(si.cpu), si.cpu.map(|v| v / 100.0)),
+        "gpu" => (info.glyph, "GPU", pct(si.gpu), si.gpu.map(|v| v / 100.0)),
+        "ram" => (
+            info.glyph,
+            "RAM",
+            si.ram.map_or_else(dash, |(u, t, _)| format!("{u:.1}/{t:.0} GB")),
+            si.ram.map(|(_, _, p)| p / 100.0),
+        ),
+        "cpu_temp" => (info.glyph, "CPU", deg(si.cpu_temp), None),
+        "gpu_temp" => (info.glyph, "GPU", deg(si.gpu_temp), None),
+        "battery" => {
+            let glyph = if si.battery.is_some_and(|(_, c)| c) { '\u{EBB5}' } else { info.glyph };
+            (glyph, "", si.battery.map_or_else(dash, |(p, _)| format!("{p}%")), si.battery.map(|(p, _)| p as f32 / 100.0))
+        }
+        "net" => (
+            info.glyph,
+            "",
+            si.net.map_or_else(dash, |(d, u)| format!("↓{}  ↑{}", crate::sysinfo::rate(d), crate::sysinfo::rate(u))),
+            None,
+        ),
+        "disk" => (info.glyph, "", si.disk.map_or_else(dash, |(f, _)| format!("{f:.0} GB free")), si.disk.map(|(f, t)| 1.0 - f / t.max(1.0))),
+        _ => return None,
+    })
+}
+
+/// The bar above the search box: components left to right.
+fn draw_top_bar(ui: &Launcher, dc: HDC, w: i32) {
+    let Some(tb) = ui.top_bar() else { return };
+    let t = &ui.theme;
+    let h = ui.top_h();
+    let bar = RECT { left: 0, top: 0, right: w, bottom: h };
+    fill(dc, &bar, mix(t.bg, t.selection, 0.45));
+    fill(dc, &RECT { left: 0, top: h - 1, right: w, bottom: h }, t.divider);
+    let mut x = ui.s(14);
+    let gap = ui.s(18);
+    for id in &tb.items {
+        let Some((glyph, label, value, meter)) = top_item(ui, id, tb) else { continue };
+        if x >= w - ui.s(14) {
+            break;
+        }
+        let rc = RECT { left: x, top: 0, right: w - ui.s(10), bottom: h };
+        let gw = ui.s(14);
+        text(dc, &glyph.to_string(), &RECT { right: x + gw, ..rc }, ui.fonts.kbd_glyph, t.subtext, DT_CENTER);
+        x += gw + ui.s(6);
+        if !label.is_empty() {
+            text(dc, label, &RECT { left: x, ..rc }, ui.fonts.header, t.subtext, DT_LEFT);
+            x += text_width(dc, label, ui.fonts.header) + ui.s(5);
+        }
+        text(dc, &value, &RECT { left: x, ..rc }, ui.fonts.small, t.text, DT_LEFT);
+        x += text_width(dc, &value, ui.fonts.small);
+        if let Some(f) = meter {
+            // A small square-ended meter.
+            let (mw, mh) = (ui.s(26), ui.s(4));
+            let my = (h - mh) / 2;
+            let track = RECT { left: x + ui.s(7), top: my, right: x + ui.s(7) + mw, bottom: my + mh };
+            fill(dc, &track, t.divider);
+            let fw = ((mw as f32) * f.clamp(0.0, 1.0)).round() as i32;
+            let col = if f > 0.9 { t.warn } else { t.accent };
+            fill(dc, &RECT { right: track.left + fw, ..track }, col);
+            x = track.right;
+        }
+        x += gap;
+    }
 }
 
 fn ago_long(then: u64) -> String {
@@ -250,6 +363,16 @@ fn draw_list(ui: &Launcher, dc: HDC) {
     let icon_dc = unsafe { CreateCompatibleDC(Some(dc)) };
     let icon_old = unsafe { SelectObject(icon_dc, GetStockObject(NULL_BRUSH)) };
 
+    // Selection highlight, drawn first so the row draws over it.
+    if let Some(i) = ui.selected.filter(|&i| matches!(ui.rows.get(i), Some(Row::Item(_)))) {
+        let (top, h) = (ui.offsets[i], ui.row_height(&ui.rows[i]));
+        let y = lr.top + top - ui.scroll;
+        let rc = RECT { left: lr.left + pad, top: y, right: lr.right - pad, bottom: y + h };
+        round_rect(dc, &rc, radius, t.selection);
+        // A thin accent edge marks the selected row (square style).
+        fill(dc, &RECT { left: rc.left, top: rc.top, right: rc.left + ui.s(3), bottom: rc.bottom }, t.accent);
+    }
+
     for (i, row) in ui.rows.iter().enumerate() {
         let rh = ui.row_height(row);
         let top = lr.top + ui.offsets[i] - ui.scroll;
@@ -265,10 +388,10 @@ fn draw_list(ui: &Launcher, dc: HDC) {
                 let r = RECT { left: rc.left + inner, top: rc.top + ui.s(8), ..rc };
                 text(dc, title, &r, ui.fonts.header, t.header, DT_LEFT);
             }
-            Row::Calc(c) => draw_calc(ui, dc, &rc, c, ui.selected == Some(i)),
+            Row::Calc(c) => draw_calc(ui, dc, &rc, c, ui.selected == Some(i), ui.pulse().filter(|_| ui.pulse_row == Some(i))),
             Row::Item(it) => {
-                if ui.selected == Some(i) {
-                    round_rect(dc, &rc, radius, t.selection);
+                if let Some(p) = ui.pulse().filter(|_| ui.pulse_row == Some(i)) {
+                    draw_row_pulse(dc, &rc, p, t, ui.s(1), ui.selected == Some(i));
                 }
                 let ix = rc.left + inner;
                 let iy = rc.top + (rh - icon) / 2;
@@ -295,6 +418,10 @@ fn draw_list(ui: &Launcher, dc: HDC) {
                     Icon::Glyph(g) => {
                         round_rect(dc, &irc, ui.s(6), t.accent);
                         text(dc, &g.to_string(), &irc, ui.fonts.glyph, WHITE, DT_CENTER);
+                    }
+                    Icon::Swatch(c) => {
+                        fill(dc, &irc, t.divider);
+                        fill(dc, &draw::inset(&irc, 1), windows::Win32::Foundation::COLORREF(*c));
                     }
                 }
 
@@ -327,7 +454,7 @@ fn draw_list(ui: &Launcher, dc: HDC) {
         let thumb = (track * view_h / ui.content_h).max(ui.s(24));
         let max_scroll = ui.content_h - view_h;
         let y = lr.top + ui.s(4) + (track - thumb) * ui.scroll / max_scroll.max(1);
-        let x = lr.right - ui.s(5);
+        let x = lr.right - ui.s(5) - ui.s(t.frame_w);
         round_rect(dc, &RECT { left: x - ui.s(3), top: y, right: x, bottom: y + thumb }, ui.s(3), t.scrollbar);
     }
 
@@ -336,9 +463,20 @@ fn draw_list(ui: &Launcher, dc: HDC) {
     }
 }
 
-fn draw_calc(ui: &Launcher, dc: HDC, row: &RECT, c: &crate::calc::Calc, selected: bool) {
+fn draw_calc(ui: &Launcher, dc: HDC, row: &RECT, c: &crate::calc::Calc, selected: bool, pulse: Option<f32>) {
     let dpi = ((ui.s(960) as f32) / 10.0).round() as u32; // effective DPI incl. launcher size
-    draw_calc_card(dc, row, c, selected, &ui.theme, &ui.fonts, dpi, ui.pulse());
+    draw_calc_card(dc, row, c, selected, &ui.theme, &ui.fonts, dpi, pulse);
+}
+
+/// The calculator's "copied" pulse, for any row: an accent ring that grows
+/// and fades while the row's fill settles back from accent.
+fn draw_row_pulse(dc: HDC, rc: &RECT, p: f32, t: &Theme, px: i32, selected: bool) {
+    let e = 1.0 - (1.0 - p).powi(3);
+    let base = if selected { t.selection } else { t.bg };
+    let grow = 2 * px + (e * 10.0 * px as f32) as i32;
+    round_rect(dc, &inflate(rc, grow), grow * 2, mix(t.accent, t.bg, e));
+    round_rect(dc, &inflate(rc, px), px * 2, mix(t.accent, t.bg, 0.4 + 0.6 * e));
+    round_rect(dc, rc, px * 6, mix(t.accent, base, 0.55 + 0.45 * e));
 }
 
 /// The calculator card: expression → answer, with the "copied" pulse
@@ -518,7 +656,7 @@ mod clip_render {
             let bmp = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
             SelectObject(dc, bmp.into());
             SetBkMode(dc, TRANSPARENT);
-            let mut fonts = Fonts::create(dpi);
+            let mut fonts = Fonts::create(dpi, &crate::config::Appearance::default());
             let t = crate::ui::theme::DARK;
             fill(dc, &RECT { left: 0, top: 0, right: total_w, bottom: ph }, t.bg);
             for (i, (e, src)) in entries.iter().zip(["Visual Studio Code", "Snipping Tool"]).enumerate() {
@@ -577,7 +715,7 @@ mod tests {
             let bmp = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
             SelectObject(dc, bmp.into());
             SetBkMode(dc, TRANSPARENT);
-            let mut fonts = Fonts::create(dpi);
+            let mut fonts = Fonts::create(dpi, &crate::config::Appearance::default());
             for (i, (pulse, selected, theme)) in frames.iter().enumerate() {
                 let top = gap + i as i32 * (row_h + gap);
                 fill(dc, &RECT { left: 0, top: top - gap, right: w, bottom: top + row_h }, theme.bg);

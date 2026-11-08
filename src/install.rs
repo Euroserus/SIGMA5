@@ -25,9 +25,9 @@ use crate::util::wide;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Each release is named after a famous engineer or researcher.
-pub const CODENAME: &str = "Euler";
+pub const CODENAME: &str = "Charpy";
 
-/// "0.2.0 “Euler”"
+/// "0.3.0 “Charpy”"
 pub fn version_label() -> String {
     format!("{VERSION} “{CODENAME}”")
 }

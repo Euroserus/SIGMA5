@@ -98,6 +98,7 @@ fn toggle(dc: HDC, t: &Theme, s: &dyn Fn(i32) -> i32, right: i32, cy: i32, on: b
 pub fn draw(dc: HDC, w: i32, h: i32, v: &View, t: &Theme, f: &Fonts, dpi: u32, logo: Option<HICON>) -> Vec<(RECT, Ctl)> {
     let s = |x: i32| (x * dpi as i32 + 48) / 96;
     let mut zones = Vec::new();
+    super::draw::set_corner_cap(s(t.radius));
     fill(dc, &RECT { left: 0, top: 0, right: w, bottom: h }, t.bg);
 
     // Logo + title.
@@ -342,7 +343,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 /// Shows the installer and runs its message loop until it closes.
 pub fn run(update: bool) -> Outcome {
     let store = ConfigStore::load();
-    let theme = theme::resolve(ThemeMode::System, Accent::Violet);
+    let theme = theme::resolve(ThemeMode::System, Accent::Violet, &crate::config::Appearance::default());
     let old_version = install::installed_version();
     let view = View {
         update,

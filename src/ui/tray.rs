@@ -47,6 +47,9 @@ fn base(hwnd: HWND) -> NOTIFYICONDATAW {
 }
 
 pub fn add(hwnd: HWND, tip: &str) {
+    if super::headless() {
+        return;
+    }
     let mut nid = base(hwnd);
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_APP_TRAY;
@@ -59,6 +62,9 @@ pub fn add(hwnd: HWND, tip: &str) {
 }
 
 pub fn set_tip(hwnd: HWND, tip: &str) {
+    if super::headless() {
+        return;
+    }
     let mut nid = base(hwnd);
     nid.uFlags = NIF_TIP;
     copy_into(&mut nid.szTip, tip);
@@ -68,6 +74,9 @@ pub fn set_tip(hwnd: HWND, tip: &str) {
 }
 
 pub fn notify(hwnd: HWND, title: &str, body: &str, warning: bool) {
+    if super::headless() {
+        return;
+    }
     let mut nid = base(hwnd);
     nid.uFlags = NIF_INFO;
     nid.dwInfoFlags = if warning { NIIF_WARNING } else { NIIF_INFO };
@@ -79,6 +88,9 @@ pub fn notify(hwnd: HWND, title: &str, body: &str, warning: bool) {
 }
 
 pub fn remove(hwnd: HWND) {
+    if super::headless() {
+        return;
+    }
     let nid = base(hwnd);
     unsafe {
         let _ = Shell_NotifyIconW(NIM_DELETE, &nid);

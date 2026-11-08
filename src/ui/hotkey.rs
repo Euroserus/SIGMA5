@@ -13,7 +13,6 @@ pub const HOTKEY_ID: i32 = 1;
 /// Opens the launcher straight on Clipboard History.
 pub const CLIPBOARD_HOTKEY_ID: i32 = 2;
 pub const APP_HOTKEY_BASE: i32 = 100;
-const PROBE_ID: i32 = 999;
 
 /// Parses a hotkey into (modifier bits, virtual key).
 pub fn parse(spec: &str) -> Result<(u8, u32), String> {
@@ -90,6 +89,9 @@ pub fn unregister(hwnd: HWND, id: i32) {
 
 /// Registers `spec` under `id`, replacing any previous registration of that id.
 pub fn register_id(hwnd: HWND, id: i32, spec: &str) -> Result<(), String> {
+    if super::headless() {
+        return Ok(());
+    }
     unregister(hwnd, id);
     let (mods, vk) = parse(spec)?;
     if reg(hwnd, id, mods, vk) {
@@ -99,19 +101,6 @@ pub fn register_id(hwnd: HWND, id: i32, spec: &str) -> Result<(), String> {
     }
 }
 
-pub fn register(hwnd: HWND, spec: &str) -> Result<(), String> {
-    register_id(hwnd, HOTKEY_ID, spec)
-}
-
-/// True if no app (including this one) currently owns the combination.
-pub fn is_free(hwnd: HWND, spec: &str) -> bool {
-    let Ok((mods, vk)) = parse(spec) else { return false };
-    let ok = reg(hwnd, PROBE_ID, mods, vk);
-    if ok {
-        unregister(hwnd, PROBE_ID);
-    }
-    ok
-}
 
 #[cfg(test)]
 mod tests {
@@ -140,3 +129,4 @@ mod tests {
         assert_eq!(normalize("shift+alt+ctrl+c").unwrap(), "Ctrl+Alt+Shift+C");
     }
 }
+

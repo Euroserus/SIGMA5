@@ -1,7 +1,7 @@
-//! Providers are SIGMA5's "extensions": each one contributes result items for
-//! a query and knows nothing about the UI. New features (web search, AI
-//! answers, calculator, unit conversion, ...) are added by writing a new
-//! provider, listing it in [`EXTENSIONS`], registering it in [`Registry`], and
+//! Providers are the result sources behind SIGMA5's modules: each one
+//! contributes items for a query and knows nothing about the UI. New features
+//! are added by writing a provider, listing the module in [`MODULES`]
+//! (which gives it an on/off switch in Settings), registering it in [`Registry`], and
 //! adding an [`Action`] variant if they need new behaviour when activated.
 
 pub mod apps;
@@ -10,8 +10,8 @@ pub mod commands;
 use crate::fuzzy::Query;
 use crate::history::History;
 
-/// Metadata shown on the Settings > Extensions page.
-pub struct ExtensionInfo {
+/// A module that can be switched off on the Settings › Modules page.
+pub struct ModuleInfo {
     pub id: &'static str,
     pub name: &'static str,
     pub description: &'static str,
@@ -19,32 +19,56 @@ pub struct ExtensionInfo {
     pub glyph: char,
 }
 
-pub const EXTENSIONS: &[ExtensionInfo] = &[
-    ExtensionInfo {
+pub const MODULES: &[ModuleInfo] = &[
+    ModuleInfo {
         id: "apps",
         name: "Applications",
         description: "Search and open installed desktop and Store apps",
         glyph: '\u{E71D}',
     },
-    ExtensionInfo {
+    ModuleInfo {
         id: "calculator",
         name: "Calculator",
         description: "Maths and unit conversions as you type; Enter copies the answer",
         glyph: '\u{E8EF}',
     },
-    ExtensionInfo {
+    ModuleInfo {
         id: "clipboard",
         name: "Clipboard History",
         description: "Remembers what you copy; private content from password managers is skipped",
         glyph: '\u{E77F}',
     },
-    ExtensionInfo {
+    ModuleInfo {
+        id: "files",
+        name: "File Search",
+        description: "Fuzzy-find files and folders in your user folder, plus recent files",
+        glyph: '\u{E8B7}',
+    },
+    ModuleInfo {
+        id: "colors",
+        name: "Colour Picker",
+        description: "Pick any colour on screen; type #hex, rgb() or hsl() to convert",
+        glyph: '\u{E790}',
+    },
+    ModuleInfo {
+        id: "topbar",
+        name: "Top Bar",
+        description: "Clock and system readings above the search box (choose them under Top Bar)",
+        glyph: '\u{E9D9}',
+    },
+    ModuleInfo {
         id: "winget",
         name: "WinGet",
         description: "Search, install, upgrade and remove packages",
         glyph: '\u{E7B8}',
     },
-    ExtensionInfo {
+    ModuleInfo {
+        id: "fidget",
+        name: "Fidget Mode",
+        description: "Shake the launcher to dissolve its letters into orbiting pixels",
+        glyph: '\u{E945}',
+    },
+    ModuleInfo {
         id: "commands",
         name: "SIGMA5 Commands",
         description: "Reload applications, open settings, quit",
@@ -59,6 +83,8 @@ pub enum Icon {
     App(String),
     /// A Segoe Fluent Icons glyph drawn on an accent tile.
     Glyph(char),
+    /// A square colour swatch (COLORREF).
+    Swatch(u32),
 }
 
 /// Built-in commands handled by the launcher itself.
@@ -77,6 +103,11 @@ pub enum Command {
     ClipboardHistory,
     ClearClipboard,
     CheckUpdates,
+    SearchFiles,
+    PickColor,
+    ColorHistory,
+    ClearColors,
+    SuggestFeature,
 }
 
 /// What Enter does on a WinGet package.
@@ -100,6 +131,14 @@ pub enum Action {
     Clip(u64),
     /// Download and install the available SIGMA5 update.
     Update,
+    /// Open a file or folder (Shift+Enter shows it in Explorer).
+    OpenFile { path: String, is_dir: bool },
+    /// A picked colour (COLORREF): Enter copies HEX, Shift+Enter RGB.
+    Color(u32),
+    /// Copy this text to the clipboard.
+    CopyText(String),
+    /// Send a feature suggestion (opens a prefilled GitHub issue).
+    Suggest(String),
 }
 
 impl Action {
@@ -114,6 +153,11 @@ impl Action {
             Action::Winget { op: WingetOp::UpgradeAll, .. } => "Upgrade All",
             Action::Clip(_) => "Paste",
             Action::Update => "Update Now",
+            Action::OpenFile { is_dir: false, .. } => "Open File",
+            Action::OpenFile { is_dir: true, .. } => "Open Folder",
+            Action::Color(_) => "Copy HEX",
+            Action::CopyText(_) => "Copy",
+            Action::Suggest(_) => "Send Suggestion",
         }
     }
 }
@@ -138,7 +182,7 @@ pub struct SearchCtx<'a> {
 }
 
 pub trait Provider {
-    /// Matches an `ExtensionInfo::id`.
+    /// Matches a `ModuleInfo::id`.
     fn id(&self) -> &'static str;
     /// Section title used when browsing with an empty query.
     fn section(&self) -> &'static str;
@@ -172,7 +216,9 @@ pub struct Registry {
     pub commands: commands::CommandsProvider,
     pub winget: commands::CommandsProvider,
     pub clipboard: commands::CommandsProvider,
-    /// Extension ids turned off in settings.
+    pub files: commands::CommandsProvider,
+    pub colors: commands::CommandsProvider,
+    /// Module ids turned off in settings.
     pub disabled: Vec<String>,
 }
 
@@ -183,12 +229,14 @@ impl Registry {
             commands: commands::SIGMA5,
             winget: commands::WINGET,
             clipboard: commands::CLIPBOARD,
+            files: commands::FILES,
+            colors: commands::COLORS,
             disabled: Vec::new(),
         }
     }
 
     fn enabled(&self) -> Vec<&dyn Provider> {
-        let all: [&dyn Provider; 4] = [&self.apps, &self.clipboard, &self.winget, &self.commands];
+        let all: [&dyn Provider; 6] = [&self.apps, &self.files, &self.colors, &self.clipboard, &self.winget, &self.commands];
         all.into_iter().filter(|p| !self.disabled.iter().any(|d| d == p.id())).collect()
     }
 

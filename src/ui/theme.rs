@@ -4,7 +4,8 @@ use windows::Win32::Foundation::COLORREF;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::core::{PCWSTR, w};
 
-use crate::config::{Accent, ThemeMode};
+use crate::config::{Accent, Appearance, ThemeMode};
+use super::draw::mix;
 
 pub const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16)
@@ -35,6 +36,11 @@ pub struct Theme {
     pub hover: COLORREF,
     pub toggle_off: COLORREF,
     pub seg_selected: COLORREF,
+    /// Corner radius in logical px (0 = square).
+    pub radius: i32,
+    /// Border round the launcher window: colour and thickness (logical px).
+    pub frame: COLORREF,
+    pub frame_w: i32,
 }
 
 pub const DARK: Theme = Theme {
@@ -58,6 +64,9 @@ pub const DARK: Theme = Theme {
     hover: rgb(64, 64, 72),
     toggle_off: rgb(86, 86, 96),
     seg_selected: rgb(78, 78, 88),
+    radius: 0,
+    frame: rgb(124, 92, 255),
+    frame_w: 0,
 };
 
 pub const LIGHT: Theme = Theme {
@@ -81,6 +90,9 @@ pub const LIGHT: Theme = Theme {
     hover: rgb(222, 222, 230),
     toggle_off: rgb(184, 184, 194),
     seg_selected: rgb(255, 255, 255),
+    radius: 0,
+    frame: rgb(110, 80, 245),
+    frame_w: 0,
 };
 
 fn reg_dword(key: PCWSTR, value: PCWSTR) -> Option<u32> {
@@ -126,7 +138,16 @@ pub fn accent_color(a: Accent) -> COLORREF {
     }
 }
 
-pub fn resolve(mode: ThemeMode, accent: Accent) -> Theme {
+/// "#RRGGBB" → COLORREF.
+pub fn parse_hex(s: &str) -> Option<COLORREF> {
+    crate::colors::parse(s).map(|c| COLORREF(c.colorref()))
+}
+
+fn luminance(c: COLORREF) -> f32 {
+    crate::colors::Color::from_colorref(c.0).luminance()
+}
+
+pub fn resolve(mode: ThemeMode, accent: Accent, look: &Appearance) -> Theme {
     let mut t = match mode {
         ThemeMode::Dark => DARK,
         ThemeMode::Light => LIGHT,
@@ -134,7 +155,54 @@ pub fn resolve(mode: ThemeMode, accent: Accent) -> Theme {
             if system_prefers_light() { LIGHT } else { DARK }
         }
     };
-    t.accent = accent_color(accent);
+    t.accent = parse_hex(&look.accent_color).unwrap_or_else(|| accent_color(accent));
+    t.radius = look.corner_radius.min(16) as i32;
+
+    // A custom background re-derives every surface from it (and from the
+    // text colour), so contrast holds whatever is chosen.
+    if let Some(bg) = parse_hex(&look.background) {
+        let dark = luminance(bg) < 0.5;
+        let base = if dark { DARK } else { LIGHT };
+        let text = parse_hex(&look.text).unwrap_or(base.text);
+        t = Theme {
+            dark,
+            bg,
+            border: mix(bg, text, 0.22),
+            divider: mix(bg, text, 0.10),
+            text,
+            subtext: mix(bg, text, 0.58),
+            header: mix(bg, text, 0.52),
+            selection: mix(bg, text, if dark { 0.11 } else { 0.08 }),
+            tile: mix(bg, text, 0.20),
+            tile_text: mix(bg, text, 0.85),
+            kbd_bg: mix(bg, text, 0.12),
+            kbd_text: mix(bg, text, 0.78),
+            scrollbar: mix(bg, text, 0.25),
+            card: mix(bg, text, if dark { 0.04 } else { 0.0 }),
+            card_border: mix(bg, text, 0.11),
+            hover: mix(bg, text, 0.16),
+            toggle_off: mix(bg, text, 0.32),
+            seg_selected: if dark { mix(bg, text, 0.22) } else { mix(bg, rgb(255, 255, 255), 1.0) },
+            ..t
+        };
+    }
+    if let Some(c) = parse_hex(&look.text) {
+        t.text = c;
+    }
+    if let Some(c) = parse_hex(&look.subtext) {
+        t.subtext = c;
+        t.header = c;
+    }
+    if let Some(c) = parse_hex(&look.selection) {
+        t.selection = c;
+    }
+    if let Some(c) = parse_hex(&look.border) {
+        t.border = c;
+        t.divider = c;
+        t.card_border = c;
+    }
+    t.frame = parse_hex(&look.window_border_color).unwrap_or(t.accent);
+    t.frame_w = look.window_border.min(8) as i32;
     t
 }
 
@@ -143,10 +211,11 @@ pub mod metrics {
     pub const WIDTH: i32 = 750;
     pub const HEIGHT: i32 = 474;
     pub const SEARCH_H: i32 = 60;
+    /// The optional top bar above the search box.
+    pub const TOPBAR_H: i32 = 30;
     pub const FOOTER_H: i32 = 40;
     pub const PAD_X: i32 = 8;
     pub const LIST_PAD_Y: i32 = 6;
-    pub const ROW_H: i32 = 44;
     pub const HEADER_H: i32 = 30;
     /// Calculator result card.
     pub const CALC_H: i32 = 122;

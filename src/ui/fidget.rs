@@ -160,8 +160,9 @@ pub const CELL: f32 = 2.0;
 const MAX_PARTICLES: usize = 3000;
 
 /// Gravity of the cursor ("sun").
-const SUN_G: f32 = 3.2e7;
-const SUN_SOFT: f32 = 24.0;
+const SUN_G: f32 = 3.0e7;
+/// How far the cursor's pull is spread out; larger means a wider area of effect.
+const SUN_SOFT: f32 = 60.0;
 /// Particles closer than this are pushed out, so the cursor stays visible.
 const SUN_CORE: f32 = 14.0;
 const SUN_CORE_PUSH: f32 = 60_000.0;
@@ -173,7 +174,7 @@ const ORBIT_RADIAL_DRAG: f32 = 0.25;
 /// Inside this radius orbits are kept a touch faster than circular and
 /// outside it a touch slower, so the swirl settles into a belt this far from
 /// the cursor instead of slowly spiralling in (or out).
-const ORBIT_BELT: f32 = 160.0;
+const ORBIT_BELT: f32 = 300.0;
 const ORBIT_BOOST: f32 = 0.05;
 /// General air drag, per second.
 const DRAG: f32 = 0.05;
@@ -189,7 +190,9 @@ const CLUMP_VISC: f32 = 0.4;
 const MAX_SPEED: f32 = 4000.0;
 const BOUNCE: f32 = 0.5;
 /// Speed at which a particle is drawn in the brightest colour.
-const HOT_SPEED: f32 = 1400.0;
+const HOT_SPEED: f32 = 800.0;
+/// The whole simulation runs at this fraction of real time, for a calmer swirl.
+const TIME_SCALE: f32 = 0.7;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Particle {
@@ -280,7 +283,7 @@ impl Sim {
     }
 
     pub fn step(&mut self, dt: f32, sun: (f32, f32)) {
-        let dt = dt.clamp(0.0, 1.0 / 20.0);
+        let dt = dt.clamp(0.0, 1.0 / 20.0) * TIME_SCALE;
         if dt <= 0.0 {
             return;
         }
@@ -1165,7 +1168,6 @@ mod tests {
         }
     }
 
-    /// Writes the grid as an uncompressed PNG, each cell `zoom` px square.
     /// Cursor path for the dump: rests by the search box, circles, rests again.
     fn dump_sun(t: f32) -> (f32, f32) {
         let a = t.min(14.0) - 8.0;
@@ -1173,55 +1175,7 @@ mod tests {
     }
 
     fn write_png(path: &str, px: &[u32], w: usize, h: usize, zoom: usize) {
-        fn crc(data: &[u8]) -> u32 {
-            let mut c = !0u32;
-            for &b in data {
-                c ^= b as u32;
-                for _ in 0..8 {
-                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
-                }
-            }
-            !c
-        }
-        fn chunk(out: &mut Vec<u8>, kind: &[u8], data: &[u8]) {
-            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-            let mut body = kind.to_vec();
-            body.extend_from_slice(data);
-            out.extend_from_slice(&body);
-            out.extend_from_slice(&crc(&body).to_be_bytes());
-        }
-        let (zw, zh) = (w * zoom, h * zoom);
-        let mut raw = Vec::with_capacity((zw * 3 + 1) * zh);
-        for y in 0..zh {
-            raw.push(0);
-            for x in 0..zw {
-                let p = px[(y / zoom) * w + x / zoom];
-                raw.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8]);
-            }
-        }
-        let mut z = vec![0x78, 0x01];
-        let blocks: Vec<&[u8]> = raw.chunks(65_535).collect();
-        for (i, b) in blocks.iter().enumerate() {
-            z.push((i + 1 == blocks.len()) as u8);
-            z.extend_from_slice(&(b.len() as u16).to_le_bytes());
-            z.extend_from_slice(&(!(b.len() as u16)).to_le_bytes());
-            z.extend_from_slice(b);
-        }
-        let (mut a, mut b) = (1u32, 0u32);
-        for &x in &raw {
-            a = (a + x as u32) % 65_521;
-            b = (b + a) % 65_521;
-        }
-        z.extend_from_slice(&(b << 16 | a).to_be_bytes());
-        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
-        let mut ihdr = Vec::new();
-        ihdr.extend_from_slice(&(zw as u32).to_be_bytes());
-        ihdr.extend_from_slice(&(zh as u32).to_be_bytes());
-        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
-        chunk(&mut out, b"IHDR", &ihdr);
-        chunk(&mut out, b"IDAT", &z);
-        chunk(&mut out, b"IEND", &[]);
-        std::fs::write(path, out).unwrap();
+        crate::ui::draw::write_png(path, px, w, h, zoom);
     }
 
     #[test]

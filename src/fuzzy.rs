@@ -46,6 +46,16 @@ impl Query {
         self.chars.is_empty()
     }
 
+    /// The lowercased words of the query.
+    pub fn words(&self) -> impl Iterator<Item = &str> {
+        self.raw.split_whitespace()
+    }
+
+    /// Lowercased query characters, whitespace removed.
+    pub fn chars(&self) -> &[char] {
+        &self.chars
+    }
+
     /// Returns `None` if the query is not a subsequence of `target`.
     pub fn score(&self, target: &str) -> Option<i32> {
         let q = &self.chars;

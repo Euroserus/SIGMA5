@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_BORDER_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DWMWA_BORDER_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
+    DWMWCP_ROUNDSMALL,
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
@@ -38,7 +39,7 @@ use super::settings;
 use super::input;
 use super::{
     WM_APP_APP_PICKED, WM_APP_CHECK_UPDATE, WM_APP_CLEAR_HISTORY, WM_APP_CONFIG_CHANGED, WM_APP_DRAG_BEGIN,
-    WM_APP_DRAG_END, WM_APP_FIDGET_CHAR, WM_APP_FIDGET_FRAME, WM_APP_PICK_APP, WM_APP_UPDATE, WM_APP_WINGET, WM_APP_WINKEY,
+    WM_APP_COLOR_PICKED, WM_APP_DRAG_END, WM_APP_SYSINFO, WM_APP_FIDGET_CHAR, WM_APP_FIDGET_FRAME, WM_APP_FILES, WM_APP_PICK_APP, WM_APP_UPDATE, WM_APP_WINGET, WM_APP_WINKEY,
 };
 use super::fidget::{Fidget, Pacer, Shake};
 use super::theme::{self, Theme, metrics as m};
@@ -48,6 +49,7 @@ use super::{
     WM_APP_RELAYOUT, WM_APP_SHOW, WM_APP_TRAY, WM_APP_TRAYCMD,
 };
 use crate::config::ConfigStore;
+use crate::files::{FileIndex, Recent};
 use crate::fuzzy::Query;
 use crate::history::History;
 use crate::launch;
@@ -56,8 +58,48 @@ use crate::providers::{Action, Command, Row};
 use crate::util::{SendHwnd, data_dir, wide};
 
 const REINDEX_AFTER: Duration = Duration::from_secs(5 * 60);
+/// The file index is refreshed in the background when older than this.
+const REFILE_AFTER: Duration = Duration::from_secs(10 * 60);
+/// Recent files shown on the Files page.
+const RECENT_FILES: usize = 40;
+
+/// Posted by File Search worker threads.
+pub enum FilesMsg {
+    Index(Box<FileIndex>, Vec<String>),
+    Recent(Vec<Recent>),
+}
+
+/// A result row for a file or folder.
+fn file_item(path: &std::path::Path, name: &str, is_dir: bool) -> crate::providers::Item {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_default();
+    crate::providers::Item {
+        key: format!("file:{}", path.display()),
+        title: name.to_string(),
+        subtitle: crate::files::display_dir(path),
+        accessory: if is_dir { "Folder".into() } else if ext.is_empty() { "File".into() } else { ext },
+        icon: crate::providers::Icon::Glyph(crate::files::glyph_for(path, is_dir)),
+        action: Action::OpenFile { path: path.to_string_lossy().to_string(), is_dir },
+        score: 0,
+    }
+}
+
+fn post_files(hwnd: SendHwnd, msg: FilesMsg) {
+    let raw = Box::into_raw(Box::new(msg));
+    unsafe {
+        if PostMessageW(Some(hwnd.get()), WM_APP_FILES, WPARAM(0), LPARAM(raw as isize)).is_err() {
+            drop(Box::from_raw(raw));
+        }
+    }
+}
+/// Drives the launcher's pulse animations at ~60 fps.
 const PULSE_TIMER: usize = 7;
+/// Hides the launcher after a launch flash.
+const FLASH_TIMER: usize = 13;
+/// How long a launched row flashes before the launcher hides.
+const FLASH_MS: u32 = 140;
 const STATUS_TIMER: usize = 8;
+/// Redraws the top bar's clock once a second while the launcher is open.
+const CLOCK_TIMER: usize = 12;
 const EDIT_ID: usize = 100;
 /// Typed letters start again from the left after this long without typing.
 const FIDGET_CARET_RESET: Duration = Duration::from_millis(1500);
@@ -117,6 +159,8 @@ pub struct Launcher {
     taskbar_created: u32,
     /// Settings window waiting for the user to pick an app (pick mode).
     pick_for: Option<HWND>,
+    /// Hotkeys another app owns, handed to the keyboard hook: (mods, key, id).
+    taken: Vec<(u8, u32, i32)>,
     /// Number of app hotkeys currently registered (ids from APP_HOTKEY_BASE).
     app_hotkeys_registered: usize,
     /// Calculator answer left in the search box after Enter (shown until edited).
@@ -141,8 +185,24 @@ pub struct Launcher {
     drag: Option<Drag>,
     /// Fidget mode (pixels orbiting the cursor), while it runs.
     fidget: Option<Box<Fidget>>,
+    /// Appearance the fonts were last built for.
+    fonts_look: crate::config::Appearance,
     /// Paces fidget frames to the monitor's refresh rate.
     pacer: Option<Pacer>,
+    /// File Search index (built in the background) and Windows' recent files.
+    files: Option<Box<FileIndex>>,
+    files_indexing: bool,
+    files_built: Option<Instant>,
+    /// The extra folders the current index was asked to cover.
+    files_folders: Vec<String>,
+    recent_files: Vec<Recent>,
+    /// Top bar readings and the thread that takes them (while it's shown).
+    pub sysinfo: crate::sysinfo::Snapshot,
+    sampler: Option<crate::sysinfo::Sampler>,
+    /// Picked colours, newest first.
+    colors: crate::colors::History,
+    /// Row the "copied" pulse is playing on (calculator card or a list row).
+    pub pulse_row: Option<usize>,
     /// Where the next typed letter appears (search box x) and when the last one was typed.
     fidget_caret: (i32, Option<Instant>),
 }
@@ -166,6 +226,9 @@ pub enum Mode {
     Root,
     Winget(crate::winget::Query),
     Clipboard,
+    Files,
+    Colors,
+    Suggest,
 }
 
 impl Mode {
@@ -176,6 +239,9 @@ impl Mode {
             Mode::Winget(crate::winget::Query::Installed) => "WinGet · Installed",
             Mode::Winget(crate::winget::Query::Upgradable) => "WinGet · Upgradable",
             Mode::Clipboard => "Clipboard History",
+            Mode::Files => "Files",
+            Mode::Colors => "Colours",
+            Mode::Suggest => "Suggest a Feature",
         }
     }
 
@@ -185,6 +251,9 @@ impl Mode {
             Mode::Winget(crate::winget::Query::Search) => "Search WinGet packages…",
             Mode::Winget(_) => "Filter packages…",
             Mode::Clipboard => "Search clipboard history…",
+            Mode::Files => "Search files and folders…",
+            Mode::Colors => "Search picked colours…",
+            Mode::Suggest => "Describe a feature you'd like…",
         }
     }
 }
@@ -220,6 +289,23 @@ impl Launcher {
         (v * self.eff_dpi() as i32 + 48) / 96
     }
 
+    /// The top bar's settings, if it is shown.
+    pub fn top_bar(&self) -> Option<&crate::config::TopBar> {
+        let c = &self.config.config;
+        (c.module_enabled("topbar") && !c.top_bar.items.is_empty()).then_some(&c.top_bar)
+    }
+
+    /// Height of the top bar (0 when it's off).
+    pub fn top_h(&self) -> i32 {
+        if self.top_bar().is_some() { self.s(m::TOPBAR_H) } else { 0 }
+    }
+
+    /// Launcher window size for the current settings.
+    fn window_size(&self) -> (i32, i32) {
+        let a = self.config.config.appearance.sane();
+        (self.s(a.width as i32), self.s(a.height as i32) + self.top_h())
+    }
+
     pub fn client_size(&self) -> (i32, i32) {
         let mut rc = RECT::default();
         unsafe {
@@ -232,7 +318,7 @@ impl Launcher {
     pub fn list_rect(&self) -> RECT {
         let (w, h) = self.client_size();
         let right = if self.mode == Mode::Clipboard { w * 41 / 100 } else { w };
-        RECT { left: 0, top: self.s(m::SEARCH_H) + 1, right, bottom: h - self.s(m::FOOTER_H) }
+        RECT { left: 0, top: self.top_h() + self.s(m::SEARCH_H) + 1, right, bottom: h - self.s(m::FOOTER_H) }
     }
 
     /// Clipboard preview pane (right of the list).
@@ -245,7 +331,7 @@ impl Launcher {
     /// Back arrow in the search bar (sub-pages only).
     pub fn back_rect(&self) -> Option<RECT> {
         (self.mode != Mode::Root).then(|| {
-            let cy = self.s(m::SEARCH_H) / 2;
+            let cy = self.top_h() + self.s(m::SEARCH_H) / 2;
             let x = self.s(12);
             RECT { left: x, top: cy - self.s(14), right: x + self.s(28), bottom: cy + self.s(14) }
         })
@@ -276,6 +362,8 @@ impl Launcher {
     pub fn secondary_hint(&self) -> Option<&'static str> {
         match self.selected_action()? {
             Action::Clip(_) => Some("Copy"),
+            Action::OpenFile { .. } => Some("Show in Folder"),
+            Action::Color(_) => Some("Copy RGB"),
             Action::Update => Some("Release Notes"),
             Action::Winget { op: crate::providers::WingetOp::Manage { has_update: true } | crate::providers::WingetOp::Upgrade, .. } => {
                 Some("Uninstall")
@@ -284,10 +372,15 @@ impl Launcher {
         }
     }
 
+    /// Height of a result row (Appearance › Row height).
+    pub fn item_h(&self) -> i32 {
+        self.s(self.config.config.appearance.sane().row_height as i32)
+    }
+
     pub fn row_height(&self, row: &Row) -> i32 {
         match row {
             Row::Header(_) => self.s(m::HEADER_H),
-            Row::Item(_) => self.s(m::ROW_H),
+            Row::Item(_) => self.item_h(),
             Row::Calc(_) => self.s(m::CALC_H),
         }
     }
@@ -352,7 +445,47 @@ impl Launcher {
             return Some("Copy Answer");
         }
         let a = self.selected_action()?;
-        Some(if self.pick_for.is_some() { "Choose App" } else { a.verb() })
+        Some(if self.pick_for.is_some() { "Choose" } else { a.verb() })
+    }
+
+    /// Whether animations are on (Appearance setting and Windows' own
+    /// "Animation effects").
+    pub fn animations(&self) -> bool {
+        if !self.config.config.appearance.animations {
+            return false;
+        }
+        let mut on = windows::core::BOOL(1);
+        unsafe {
+            let _ = SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, Some(&mut on as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+        }
+        on.as_bool()
+    }
+
+    /// Keeps the animation timer running while anything is moving.
+    fn kick_anim(&self) {
+        unsafe {
+            SetTimer(Some(self.hwnd), PULSE_TIMER, 15, None);
+        }
+    }
+
+    fn animating(&self) -> bool {
+        self.pulse().is_some()
+    }
+
+    /// Flashes the activated row, then hides (the launch itself isn't delayed).
+    fn flash_then_hide(&mut self, idx: usize) {
+        self.reset_on_show = true;
+        if !self.animations() {
+            self.hide();
+            return;
+        }
+        self.pulse_row = Some(idx);
+        self.pulse_start = Some(Instant::now());
+        self.kick_anim();
+        unsafe {
+            SetTimer(Some(self.hwnd), FLASH_TIMER, FLASH_MS, None);
+        }
+        self.invalidate();
     }
 
     /// Progress of the "copied" pulse, 0 → 1, while it is running.
@@ -392,7 +525,7 @@ impl Launcher {
     fn new(hwnd: HWND) -> Box<Self> {
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
         let config = ConfigStore::load();
-        let theme = theme::resolve(config.config.theme, config.config.accent);
+        let theme = theme::resolve(config.config.theme, config.config.accent, &config.config.appearance);
         let zoom = config.config.size.percent();
         let mut me = Box::new(Self {
             hwnd,
@@ -400,7 +533,7 @@ impl Launcher {
             dpi,
             zoom,
             theme,
-            fonts: Fonts::create(dpi * zoom / 100),
+            fonts: Fonts::create(dpi * zoom / 100, &config.config.appearance),
             logo: None,
             backbuf: BackBuffer::default(),
             config,
@@ -424,6 +557,7 @@ impl Launcher {
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
             pick_for: None,
             app_hotkeys_registered: 0,
+            taken: Vec::new(),
             calc_hold: None,
             pulse_start: None,
             mode: Mode::Root,
@@ -438,6 +572,16 @@ impl Launcher {
             drag: None,
             fidget: None,
             pacer: None,
+            fonts_look: Default::default(),
+            files: None,
+            files_indexing: false,
+            files_built: None,
+            files_folders: Vec::new(),
+            recent_files: Vec::new(),
+            sysinfo: crate::sysinfo::Snapshot::default(),
+            sampler: None,
+            colors: crate::colors::History::load(),
+            pulse_row: None,
             fidget_caret: (0, None),
         });
         me.create_edit();
@@ -447,6 +591,7 @@ impl Launcher {
         me.apply_config(true);
         me.refresh_rows(false);
         me.start_index(false);
+        me.start_file_index();
         me.after_start();
         me
     }
@@ -467,6 +612,9 @@ impl Launcher {
     }
 
     fn on_update_timer(&mut self) {
+        if super::headless() {
+            return;
+        }
         unsafe {
             SetTimer(Some(self.hwnd), UPDATE_TIMER, UPDATE_EVERY_MS, None);
         }
@@ -591,7 +739,7 @@ impl Launcher {
     fn apply_dpi(&mut self, dpi: u32, reload_icons: bool) {
         self.dpi = dpi;
         self.fonts.destroy();
-        self.fonts = Fonts::create(self.eff_dpi());
+        self.fonts = Fonts::create(self.eff_dpi(), &self.config.config.appearance);
         if let Some(old) = self.logo.take() {
             unsafe {
                 let _ = DestroyIcon(old);
@@ -614,13 +762,13 @@ impl Launcher {
 
     fn layout_edit(&self) {
         let (w, _) = self.client_size();
-        let w = if w <= 0 { self.s(m::WIDTH) } else { w };
+        let w = if w <= 0 { self.window_size().0 } else { w };
         let th = text_height(self.fonts.search);
         let sub = self.mode != Mode::Root;
         // Sub-pages: back arrow on the left, page title on the right.
         let x = self.s(m::TEXT_X) - self.s(3) + if sub { self.s(30) } else { 0 };
         let right_pad = if sub { self.s(190) } else { self.s(m::TEXT_X) - self.s(3) };
-        let y = (self.s(m::SEARCH_H) - th) / 2;
+        let y = self.top_h() + (self.s(m::SEARCH_H) - th) / 2;
         unsafe {
             let _ = SetWindowPos(self.edit, None, x, y, w - x - right_pad, th, SWP_NOZORDER | SWP_NOACTIVATE);
         }
@@ -636,9 +784,15 @@ impl Launcher {
             EDIT_STYLE.with(|c| c.set((self.edit_brush, t.bg, t.text)));
             let dark: i32 = t.dark as i32;
             let _ = DwmSetWindowAttribute(self.hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as *const _, 4);
-            let corner = DWMWCP_ROUND;
+            // Square corners unless a radius is chosen.
+            let corner = match t.radius {
+                0 => DWMWCP_DONOTROUND,
+                1..=5 => DWMWCP_ROUNDSMALL,
+                _ => DWMWCP_ROUND,
+            };
             let _ = DwmSetWindowAttribute(self.hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner as *const _ as *const _, 4);
-            let border = t.border;
+            // Windows' own 1 px border takes the frame's colour so they blend.
+            let border = if t.frame_w > 0 { t.frame } else { t.border };
             let _ = DwmSetWindowAttribute(self.hwnd, DWMWA_BORDER_COLOR, &border as *const _ as *const _, 4);
             let _ = InvalidateRect(Some(self.edit), None, true);
         }
@@ -650,12 +804,31 @@ impl Launcher {
     fn apply_config(&mut self, first: bool) {
         let cfg = self.config.config.clone();
         launch::set_start_with_windows(cfg.start_with_windows);
-        input::configure(self.hwnd, input::Rules { win_tap: cfg.windows_key, remaps: cfg.key_rules() });
+        self.taken.clear();
         self.register_app_hotkeys(&cfg);
-        self.registry.disabled = cfg.disabled_extensions.clone();
+        self.registry.disabled = cfg.disabled_modules.clone();
+        // File Search: free the index when off; rebuild when its folders change.
+        if !cfg.module_enabled("files") {
+            self.files = None;
+            self.files_built = None;
+        } else if !first && (self.files.is_none() || self.files_folders != cfg.file_folders) {
+            self.files_built = None;
+            self.start_file_index();
+        }
+        self.files_folders = cfg.file_folders.clone();
+        self.update_sampler();
+        if !first && self.visible {
+            // The top bar may have appeared or gone: resize and re-lay out.
+            let (w, h) = self.window_size();
+            unsafe {
+                let _ = SetWindowPos(self.hwnd, None, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            self.layout_edit();
+            self.relayout_rows();
+        }
 
-        // Clipboard history: listen only while the extension is on.
-        let want_clip = cfg.extension_enabled("clipboard");
+        // Clipboard history: listen only while the module is on.
+        let want_clip = cfg.module_enabled("clipboard") && !super::headless();
         unsafe {
             use windows::Win32::System::DataExchange::{AddClipboardFormatListener, RemoveClipboardFormatListener};
             if want_clip && !self.clip_listening {
@@ -667,16 +840,22 @@ impl Launcher {
         }
         hotkey::unregister(self.hwnd, hotkey::CLIPBOARD_HOTKEY_ID);
         if want_clip && !cfg.clipboard_hotkey.trim().is_empty() {
-            if let Err(e) = hotkey::register_id(self.hwnd, hotkey::CLIPBOARD_HOTKEY_ID, &cfg.clipboard_hotkey) {
+            if let Err(e) = self.grab_hotkey(hotkey::CLIPBOARD_HOTKEY_ID, &cfg.clipboard_hotkey) {
                 self.set_status(format!("Clipboard hotkey: {e}"), true, None);
             }
         }
 
-        let t = theme::resolve(cfg.theme, cfg.accent);
+        let t = theme::resolve(cfg.theme, cfg.accent, &cfg.appearance);
         if t != self.theme || first {
             self.theme = t;
             self.apply_theme();
         }
+        // New font or text size: rebuild fonts and re-lay out.
+        let (old, new) = (&self.fonts_look, &cfg.appearance);
+        if !first && (old.font != new.font || old.search_font != new.search_font || old.font_scale != new.font_scale) {
+            self.apply_dpi(self.dpi, false);
+        }
+        self.fonts_look = cfg.appearance.clone();
         let zoom = cfg.size.percent();
         if zoom != self.zoom {
             self.zoom = zoom;
@@ -684,7 +863,7 @@ impl Launcher {
         }
 
         self.status = None;
-        match hotkey::register(self.hwnd, &cfg.hotkey) {
+        match self.grab_hotkey(hotkey::HOTKEY_ID, &cfg.hotkey) {
             Ok(()) => tray::set_tip(self.hwnd, &format!("SIGMA5 ({})", cfg.hotkey)),
             Err(e) => {
                 if first {
@@ -693,6 +872,8 @@ impl Launcher {
                 self.set_status(e, true, None);
             }
         }
+        // The keyboard hook: remaps, Windows key, and hotkeys taken over above.
+        input::configure(self.hwnd, input::Rules { win_tap: cfg.windows_key, remaps: cfg.key_rules(), hotkeys: self.taken.clone() });
         if let Some(err) = self.config.error.clone() {
             self.set_status(err, true, None);
         }
@@ -711,18 +892,35 @@ impl Launcher {
             if b.hotkey.trim().is_empty() {
                 continue;
             }
-            if hotkey::register_id(self.hwnd, hotkey::APP_HOTKEY_BASE + i as i32, &b.hotkey).is_err() {
-                failed.push(format!("{} ({})", b.hotkey, b.name));
+            if let Err(e) = self.grab_hotkey(hotkey::APP_HOTKEY_BASE + i as i32, &b.hotkey) {
+                failed.push(format!("{} ({e})", b.name));
             }
         }
         self.app_hotkeys_registered = cfg.app_hotkeys.len();
         if !failed.is_empty() {
-            self.set_status(format!("Hotkey in use by another app: {}", failed.join(", ")), true, None);
+            self.set_status(format!("Invalid hotkey: {}", failed.join(", ")), true, None);
         }
+    }
+
+    /// Registers a hotkey. If another app already owns it, the keyboard hook
+    /// takes it over instead (it sees keys before Windows dispatches hotkeys).
+    fn grab_hotkey(&mut self, id: i32, spec: &str) -> Result<(), String> {
+        let (mods, vk) = hotkey::parse(spec)?;
+        if hotkey::register_id(self.hwnd, id, spec).is_err() {
+            self.taken.push((mods, vk, id));
+        }
+        Ok(())
     }
 
     fn on_app_hotkey(&mut self, index: usize) {
         let Some(b) = self.config.config.app_hotkeys.get(index) else { return };
+        // A SIGMA5 or module command bound to a hotkey.
+        if let Some((module, _, _, cmd)) = crate::providers::commands::find(&b.app) {
+            if self.config.config.module_enabled(module) {
+                self.run_command_hotkey(cmd);
+            }
+            return;
+        }
         let exe = self
             .registry
             .apps
@@ -732,13 +930,45 @@ impl Launcher {
         crate::focus::focus_or_launch(&b.app, exe.as_deref());
     }
 
+    /// Runs a command from its hotkey. Commands that open a page show the
+    /// launcher on it (or close it if that page is already in front).
+    fn run_command_hotkey(&mut self, c: Command) {
+        let page = match c {
+            Command::SearchFiles => Some(Mode::Files),
+            Command::SuggestFeature => Some(Mode::Suggest),
+            Command::ColorHistory => Some(Mode::Colors),
+            Command::ClipboardHistory => Some(Mode::Clipboard),
+            Command::WingetSearch => Some(Mode::Winget(crate::winget::Query::Search)),
+            Command::WingetInstalled => Some(Mode::Winget(crate::winget::Query::Installed)),
+            Command::WingetUpgradable => Some(Mode::Winget(crate::winget::Query::Upgradable)),
+            _ => None,
+        };
+        if let Some(mode) = page {
+            let fg = unsafe { GetForegroundWindow() };
+            if self.visible && fg == self.hwnd && self.mode == mode {
+                self.hide();
+                return;
+            }
+            if !self.visible || fg != self.hwnd {
+                self.show();
+            }
+            if self.mode == mode {
+                return;
+            }
+            if self.mode != Mode::Root {
+                self.go_back();
+            }
+        }
+        self.run_command(c);
+    }
+
     /// Shows the launcher so the user can pick an app for the Settings window.
     fn start_pick(&mut self, settings: HWND) {
         self.reset_on_show = true;
         self.hidden_at = None;
         self.pick_for = Some(settings);
         self.show();
-        self.set_status("Choose an app for the new hotkey", false, None);
+        self.set_status("Choose an app or command for the new hotkey", false, None);
         self.refresh_rows(false);
     }
 
@@ -799,6 +1029,37 @@ impl Launcher {
             Mode::Root => self.rows = self.registry.rows(&q, &self.history, self.config.config.recent_count),
             Mode::Winget(kind) => self.rows = self.winget_rows(kind, &q),
             Mode::Clipboard => self.rows = self.clip_rows(&q),
+            Mode::Files => self.rows = self.file_rows(&q),
+            Mode::Colors => self.rows = self.color_rows(&q),
+            Mode::Suggest => self.rows = self.suggest_rows(),
+        }
+        // A typed colour (#hex, rgb(), hsl()) at the top, in every format.
+        if self.mode == Mode::Root && self.pick_for.is_none() && self.config.config.module_enabled("colors") {
+            if let Some(c) = crate::colors::parse(&self.query) {
+                let mut rows = vec![Row::Header("Colour")];
+                for (label, text) in [("HEX", c.hex()), ("RGB", c.rgb()), ("HSL", c.hsl())] {
+                    rows.push(Row::Item(crate::providers::Item {
+                        key: format!("colorfmt:{label}"),
+                        title: text.clone(),
+                        subtitle: String::new(),
+                        accessory: label.into(),
+                        icon: crate::providers::Icon::Swatch(c.colorref()),
+                        action: Action::CopyText(text),
+                        score: 0,
+                    }));
+                }
+                self.rows.splice(0..0, rows);
+            }
+        }
+        // A few file matches under the root results.
+        if self.mode == Mode::Root && self.pick_for.is_none() && q.chars().len() >= 2 && self.config.config.module_enabled("files") {
+            if let Some(idx) = &self.files {
+                let hits = idx.search(&q, 4);
+                if !hits.is_empty() {
+                    self.rows.push(Row::Header("Files"));
+                    self.rows.extend(hits.into_iter().map(|h| Row::Item(file_item(&h.path, &h.name, h.is_dir))));
+                }
+            }
         }
         // Update banner at the top of the root page.
         if let (Mode::Root, None, Some(info)) = (self.mode, self.pick_for, &self.update) {
@@ -818,12 +1079,12 @@ impl Launcher {
         if self.mode != Mode::Root {
             // Sub-pages have no calculator or pick mode.
         } else if self.pick_for.is_some() {
-            // Pick mode: apps only, and drop headers left with no items.
+            // Pick mode: apps and commands only, and drop headers left with no items.
             let rows = std::mem::take(&mut self.rows);
             let kept: Vec<Row> = rows
                 .into_iter()
                 .filter(|r| match r {
-                    Row::Item(it) => matches!(it.action, Action::LaunchApp { .. }),
+                    Row::Item(it) => matches!(it.action, Action::LaunchApp { .. } | Action::Command(_)),
                     Row::Calc(_) => false,
                     Row::Header(_) => true,
                 })
@@ -834,7 +1095,7 @@ impl Launcher {
                     self.rows.push(r.clone());
                 }
             }
-        } else if self.config.config.extension_enabled("calculator") {
+        } else if self.config.config.module_enabled("calculator") {
             // A chained answer stays on screen until the text changes.
             let calc = match &self.calc_hold {
                 Some(h) if h.chain == self.query.trim() => Some(h.clone()),
@@ -1066,6 +1327,218 @@ impl Launcher {
         rows
     }
 
+    // ----- Top bar ------------------------------------------------------------
+
+    /// Starts, retargets or stops the top bar's sampler to match the settings.
+    fn update_sampler(&mut self) {
+        let needs = self.top_bar().map_or(0, |tb| crate::sysinfo::needs(&tb.items));
+        match (&self.sampler, needs) {
+            (Some(_), 0) => {
+                self.sampler = None;
+                self.sysinfo = Default::default();
+            }
+            (Some(s), n) => s.set_needs(n),
+            (None, 0) => {}
+            (None, n) => {
+                let s = crate::sysinfo::Sampler::start(self.hwnd, WM_APP_SYSINFO, n);
+                s.set_active(self.visible);
+                self.sampler = Some(s);
+            }
+        }
+    }
+
+    fn on_sysinfo(&mut self, snap: crate::sysinfo::Snapshot) {
+        if snap != self.sysinfo {
+            self.sysinfo = snap;
+            if self.visible {
+                let rc = RECT { left: 0, top: 0, right: self.client_size().0, bottom: self.top_h() };
+                unsafe {
+                    let _ = InvalidateRect(Some(self.hwnd), Some(&rc), false);
+                }
+            }
+        }
+    }
+
+    // ----- File Search ------------------------------------------------------
+
+    /// Builds the file index on a worker thread (no-op if already running).
+    fn start_file_index(&mut self) {
+        if self.files_indexing || !self.config.config.module_enabled("files") {
+            return;
+        }
+        self.files_indexing = true;
+        let folders = self.config.config.file_folders.clone();
+        let hwnd = SendHwnd::new(self.hwnd);
+        let _ = std::thread::Builder::new().name("sigma5-files".into()).spawn(move || {
+            let idx = FileIndex::build(&crate::files::default_roots(&folders));
+            post_files(hwnd, FilesMsg::Index(Box::new(idx), folders));
+        });
+    }
+
+    /// Reads Windows' recent files on a worker thread.
+    fn load_recent_files(&mut self) {
+        let hwnd = SendHwnd::new(self.hwnd);
+        let _ = std::thread::Builder::new().name("sigma5-recent".into()).spawn(move || unsafe {
+            use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let r = crate::files::recent_files(RECENT_FILES);
+            CoUninitialize();
+            post_files(hwnd, FilesMsg::Recent(r));
+        });
+    }
+
+    fn on_files_msg(&mut self, msg: FilesMsg) {
+        match msg {
+            FilesMsg::Index(idx, folders) => {
+                self.files_indexing = false;
+                if !self.config.config.module_enabled("files") {
+                    return; // turned off meanwhile
+                }
+                self.files = Some(idx);
+                self.files_built = Some(Instant::now());
+                if folders != self.config.config.file_folders {
+                    self.start_file_index(); // folders changed while indexing
+                }
+            }
+            FilesMsg::Recent(r) => self.recent_files = r,
+        }
+        if self.visible && (self.mode == Mode::Files || !self.query.trim().is_empty()) {
+            self.refresh_rows(true);
+        }
+    }
+
+    fn file_rows(&mut self, q: &Query) -> Vec<Row> {
+        let mut rows = Vec::new();
+        if q.is_empty() {
+            if !self.recent_files.is_empty() {
+                rows.push(Row::Header("Recent Files"));
+                rows.extend(self.recent_files.iter().map(|r| Row::Item(file_item(&r.path, &r.name, r.is_dir))));
+            } else {
+                let n = self.files.as_ref().map_or(0, |f| f.len());
+                self.list_message = Some(if n > 0 { format!("Type to search {n} files and folders") } else { "Type to search your files".into() });
+            }
+            return rows;
+        }
+        match &self.files {
+            Some(idx) => {
+                let hits = idx.search(q, 60);
+                if hits.is_empty() {
+                    self.list_message = Some("No matching files".into());
+                } else {
+                    rows.push(Row::Header("Files"));
+                    rows.extend(hits.into_iter().map(|h| Row::Item(file_item(&h.path, &h.name, h.is_dir))));
+                }
+            }
+            None => self.list_message = Some("Indexing your files…".into()),
+        }
+        rows
+    }
+
+    // ----- Suggest a Feature ------------------------------------------------
+
+    /// The suggestion page: what's typed becomes the suggestion.
+    fn suggest_rows(&mut self) -> Vec<Row> {
+        let idea = self.query.trim().to_string();
+        if idea.is_empty() {
+            self.list_message = Some("Type your idea, then press Enter to send it on WhatsApp".into());
+            return Vec::new();
+        }
+        vec![
+            Row::Header("Suggestion"),
+            Row::Item(crate::providers::Item {
+                key: "suggest".into(),
+                title: idea.clone(),
+                subtitle: "Opens WhatsApp with your idea typed in; press Send there".into(),
+                accessory: "WhatsApp".into(),
+                icon: crate::providers::Icon::Glyph('\u{E82F}'),
+                action: Action::Suggest(idea),
+                score: 0,
+            }),
+        ]
+    }
+
+    // ----- Colours -----------------------------------------------------------
+
+    fn color_rows(&mut self, q: &Query) -> Vec<Row> {
+        use crate::providers::Item;
+        let mut rows = Vec::new();
+        let items: Vec<Item> = self
+            .colors
+            .items()
+            .iter()
+            .filter(|p| q.is_empty() || q.score(&format!("{} {} {}", p.color.hex(), p.color.rgb(), p.color.hsl())).is_some())
+            .map(|p| Item {
+                key: format!("color:{}", p.color.hex()),
+                title: p.color.hex(),
+                subtitle: format!("{}  ·  {}", p.color.rgb(), p.color.hsl()),
+                accessory: crate::util::ago(p.at),
+                icon: crate::providers::Icon::Swatch(p.color.colorref()),
+                action: Action::Color(p.color.colorref()),
+                score: 0,
+            })
+            .collect();
+        if q.is_empty() {
+            rows.push(Row::Header("Actions"));
+            if let Some(it) = crate::providers::Provider::lookup(&self.registry.colors, "cmd:PickColor") {
+                rows.push(Row::Item(it));
+            }
+        }
+        if !items.is_empty() {
+            rows.push(Row::Header("Picked Colours"));
+            rows.extend(items.into_iter().map(Row::Item));
+        } else if !q.is_empty() {
+            self.list_message = Some("No matching colours".into());
+        }
+        rows
+    }
+
+    fn start_color_pick(&mut self) {
+        self.reset_on_show = false;
+        self.hide();
+        super::picker::start(self.hwnd, self.theme.accent);
+    }
+
+    /// Picker result: copy it, remember it, and show it in Colour History.
+    fn on_color_picked(&mut self, colorref: u32, ok: bool) {
+        if !ok {
+            return;
+        }
+        let c = crate::colors::Color::from_colorref(colorref);
+        self.colors.add(c);
+        self.hidden_at = None;
+        self.reset_on_show = true;
+        self.show();
+        self.enter_mode(Mode::Colors);
+        let row = self.rows.iter().position(|r| matches!(r, Row::Item(it) if matches!(it.action, Action::Color(v) if v == colorref)));
+        if let Some(i) = row {
+            self.selected = Some(i);
+            self.ensure_visible(i);
+        }
+        self.copy_with_pulse(&c.hex(), row);
+    }
+
+    /// Copies `text`, plays the pulse on `row`, and confirms in the footer.
+    fn copy_with_pulse(&mut self, text: &str, row: Option<usize>) {
+        if crate::util::copy_to_clipboard(self.hwnd, text) {
+            self.pulse_row = row;
+            self.pulse_start = Some(Instant::now());
+            unsafe {
+                SetTimer(Some(self.hwnd), PULSE_TIMER, 15, None);
+                SetTimer(Some(self.hwnd), STATUS_TIMER, 2600, None);
+            }
+            self.set_status(format!("Copied {text}"), false, Some(Duration::from_millis(2500)));
+        } else {
+            self.set_status("Clipboard is busy; try again", true, Some(Duration::from_secs(3)));
+        }
+    }
+
+    fn delete_selected_color(&mut self) {
+        if let Some(Action::Color(c)) = self.selected_action().cloned() {
+            self.colors.remove(crate::colors::Color::from_colorref(c));
+            self.refresh_rows(true);
+        }
+    }
+
     fn clip_rows(&mut self, q: &Query) -> Vec<Row> {
         use crate::clipboard::Content;
         use crate::providers::{Icon, Item};
@@ -1180,7 +1653,7 @@ impl Launcher {
             self.apply_config(false);
         }
         // System theme/accent may have changed while hidden.
-        let t = theme::resolve(self.config.config.theme, self.config.config.accent);
+        let t = theme::resolve(self.config.config.theme, self.config.config.accent, &self.config.config.appearance);
         if t != self.theme {
             self.theme = t;
             self.apply_theme();
@@ -1198,7 +1671,7 @@ impl Launcher {
             let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
             let _ = GetMonitorInfoW(mon, &mut mi);
             let wa = mi.rcWork;
-            let (w, h) = (self.s(m::WIDTH), self.s(m::HEIGHT));
+            let (w, h) = self.window_size();
             let x = wa.left + ((wa.right - wa.left) - w) / 2;
             let y = (wa.top + ((wa.bottom - wa.top) as f32 * m::TOP_FRACTION) as i32).min(wa.bottom - h).max(wa.top);
             let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE);
@@ -1255,6 +1728,18 @@ impl Launcher {
             }
             let _ = SetFocus(Some(self.edit));
         }
+        if let Some(s) = &self.sampler {
+            s.set_active(true);
+        }
+        unsafe {
+            SetTimer(Some(self.hwnd), CLOCK_TIMER, 1000, None);
+        }
+        if self.files_built.is_none_or(|t| t.elapsed() > REFILE_AFTER) {
+            self.start_file_index();
+        }
+        if self.mode == Mode::Files {
+            self.load_recent_files();
+        }
         if !self.indexing && self.last_index.is_none_or(|t| t.elapsed() > REINDEX_AFTER) {
             self.start_index(false);
         }
@@ -1269,6 +1754,15 @@ impl Launcher {
         self.press_row = None;
         self.drag = None;
         self.stop_fidget();
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), FLASH_TIMER);
+        }
+        if let Some(s) = &self.sampler {
+            s.set_active(false);
+        }
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), CLOCK_TIMER);
+        }
         if self.pick_for.take().is_some() {
             // Pick cancelled (or finished): back to normal mode next time.
             self.status = None;
@@ -1312,7 +1806,7 @@ impl Launcher {
     fn on_nav(&mut self, vk: VIRTUAL_KEY, ctrl: bool, shift: bool) {
         let page = {
             let lr = self.list_rect();
-            ((lr.bottom - lr.top) / self.s(m::ROW_H)).max(1)
+            ((lr.bottom - lr.top) / self.item_h()).max(1)
         };
         if self.fidget.is_some() {
             match vk {
@@ -1348,6 +1842,7 @@ impl Launcher {
             // Backspace on an empty box (sent by the search box) goes back.
             VK_BACK => self.go_back(),
             VK_DELETE if shift && self.mode == Mode::Clipboard => self.delete_selected_clip(),
+            VK_DELETE if shift && self.mode == Mode::Colors => self.delete_selected_color(),
             // Ctrl+, opens settings.
             VIRTUAL_KEY(0xBC) if ctrl => self.open_settings(),
             _ => {}
@@ -1369,6 +1864,7 @@ impl Launcher {
         }
         self.refresh_rows(false);
         if copied {
+            self.pulse_row = self.rows.iter().position(|r| matches!(r, Row::Calc(_)));
             self.pulse_start = Some(Instant::now());
             unsafe {
                 SetTimer(Some(self.hwnd), PULSE_TIMER, 15, None);
@@ -1383,11 +1879,18 @@ impl Launcher {
     }
 
     fn on_timer(&mut self, id: usize) {
-        if id == PULSE_TIMER && self.pulse().is_none() {
+        if id == PULSE_TIMER && !self.animating() {
             self.pulse_start = None;
             unsafe {
                 let _ = KillTimer(Some(self.hwnd), PULSE_TIMER);
             }
+        }
+        if id == FLASH_TIMER {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), FLASH_TIMER);
+            }
+            self.hide();
+            return;
         }
         if id == STATUS_TIMER {
             unsafe {
@@ -1416,6 +1919,31 @@ impl Launcher {
                 self.activate_clip(id, shift);
                 return;
             }
+            Action::Color(c) => {
+                let c = crate::colors::Color::from_colorref(*c);
+                let text = if shift { c.rgb() } else { c.hex() };
+                self.copy_with_pulse(&text, Some(idx));
+                return;
+            }
+            Action::CopyText(t) => {
+                let t = t.clone();
+                self.copy_with_pulse(&t, Some(idx));
+                return;
+            }
+            Action::Suggest(idea) => {
+                let text = crate::util::suggestion_text(idea, &crate::install::version_label());
+                self.allow_foreground();
+                launch::open_whatsapp(crate::util::SUGGEST_PHONE, &text);
+                self.flash_then_hide(idx);
+                return;
+            }
+            Action::OpenFile { path, .. } => {
+                let p = std::path::PathBuf::from(path);
+                self.allow_foreground();
+                if shift { launch::reveal(&p) } else { launch::open_file(&p) }
+                self.flash_then_hide(idx);
+                return;
+            }
             Action::Update => {
                 if shift {
                     // Shift+Enter: read the release notes first.
@@ -1431,9 +1959,14 @@ impl Launcher {
             }
             _ => {}
         }
-        if let (Some(settings), Action::LaunchApp { id }) = (self.pick_for, &action) {
-            // Pick mode: hand the app to Settings instead of launching it.
-            let picked = Box::into_raw(Box::new((id.clone(), it.title.clone())));
+        let pick_id = match &action {
+            Action::LaunchApp { id } => Some(id.clone()),
+            Action::Command(_) => Some(key.clone()),
+            _ => None,
+        };
+        if let (Some(settings), Some(id)) = (self.pick_for, pick_id) {
+            // Pick mode: hand the app (or command) to Settings instead of running it.
+            let picked = Box::into_raw(Box::new((id, it.title.clone())));
             unsafe {
                 if PostMessageW(Some(settings), WM_APP_APP_PICKED, WPARAM(0), LPARAM(picked as isize)).is_err() {
                     drop(Box::from_raw(picked));
@@ -1450,11 +1983,10 @@ impl Launcher {
                     let _ = AllowSetForegroundWindow(ASFW_ANY);
                 }
                 launch::launch_app(&id);
-                self.reset_on_show = true;
-                self.hide();
+                self.flash_then_hide(idx);
             }
             Action::Command(c) => self.run_command(c),
-            Action::Winget { .. } | Action::Clip(_) | Action::Update => {}
+            Action::Winget { .. } | Action::Clip(_) | Action::Update | Action::OpenFile { .. } | Action::Color(_) | Action::CopyText(_) | Action::Suggest(_) => {}
         }
     }
 
@@ -1493,6 +2025,21 @@ impl Launcher {
                 self.hide();
             }
             Command::ClipboardHistory => self.enter_mode(Mode::Clipboard),
+            Command::PickColor => self.start_color_pick(),
+            Command::SuggestFeature => self.enter_mode(Mode::Suggest),
+            Command::ColorHistory => self.enter_mode(Mode::Colors),
+            Command::ClearColors => {
+                self.colors.clear();
+                self.refresh_rows(false);
+                self.set_status("Colour history cleared", false, Some(Duration::from_secs(3)));
+                unsafe {
+                    SetTimer(Some(self.hwnd), STATUS_TIMER, 3100, None);
+                }
+            }
+            Command::SearchFiles => {
+                self.load_recent_files();
+                self.enter_mode(Mode::Files);
+            }
             Command::CheckUpdates => self.start_update_check(true),
             Command::ClearClipboard => {
                 self.clip.clear();
@@ -1532,7 +2079,7 @@ impl Launcher {
     fn is_drag_handle(&self, x: i32, y: i32) -> bool {
         let (_, h) = self.client_size();
         let on_back = self.back_rect().is_some_and(|r| super::draw::contains(&r, x, y));
-        (y < self.s(m::SEARCH_H) && !on_back) || y >= h - self.s(m::FOOTER_H)
+        (y < self.top_h() + self.s(m::SEARCH_H) && !on_back) || y >= h - self.s(m::FOOTER_H)
     }
 
     fn begin_drag(&mut self) {
@@ -1561,7 +2108,8 @@ impl Launcher {
                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
-        if d.shake.sample(d.started.elapsed().as_secs_f32(), pt.x as f32, pt.y as f32) {
+        let fidget_on = self.config.config.module_enabled("fidget");
+        if d.shake.sample(d.started.elapsed().as_secs_f32(), pt.x as f32, pt.y as f32) && fidget_on {
             let (vx, vy) = d.shake.velocity();
             let u = self.unit();
             if self.fidget.is_some() {
@@ -1701,7 +2249,7 @@ impl Launcher {
     }
 
     fn on_wheel(&mut self, delta: i32) {
-        let step = self.s(m::ROW_H) * 3 * delta / 120;
+        let step = self.item_h() * 3 * delta / 120;
         let s = (self.scroll - step).clamp(0, self.max_scroll());
         if s != self.scroll {
             self.scroll = s;
@@ -1733,13 +2281,13 @@ impl Launcher {
                     None,
                     0,
                     0,
-                    self.s(m::WIDTH),
-                    self.s(m::HEIGHT),
+                    self.window_size().0,
+                    self.window_size().1,
                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             }
         }
-        let t = theme::resolve(self.config.config.theme, self.config.config.accent);
+        let t = theme::resolve(self.config.config.theme, self.config.config.accent, &self.config.config.appearance);
         if t != self.theme {
             self.theme = t;
             self.apply_theme();
@@ -1990,6 +2538,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_APP_WINKEY => {
             ui.toggle();
+            LRESULT(0)
+        }
+        WM_APP_SYSINFO => {
+            let s = unsafe { Box::from_raw(lp.0 as *mut crate::sysinfo::Snapshot) };
+            ui.on_sysinfo(*s);
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == CLOCK_TIMER => {
+            if ui.top_bar().is_some() {
+                let rc = RECT { left: 0, top: 0, right: ui.client_size().0, bottom: ui.top_h() };
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), Some(&rc), false);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_APP_COLOR_PICKED => {
+            ui.on_color_picked(wp.0 as u32, lp.0 != 0);
+            LRESULT(0)
+        }
+        WM_APP_FILES => {
+            let m = unsafe { Box::from_raw(lp.0 as *mut FilesMsg) };
+            ui.on_files_msg(*m);
             LRESULT(0)
         }
         WM_APP_WINGET => {
@@ -2262,3 +2833,7 @@ unsafe fn delete_word_back(edit: HWND) {
         SendMessageW(edit, EM_REPLACESEL, Some(WPARAM(1)), Some(LPARAM(empty.as_ptr() as isize)));
     }
 }
+
+#[cfg(test)]
+#[path = "harness.rs"]
+mod harness;

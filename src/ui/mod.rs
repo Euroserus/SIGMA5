@@ -8,12 +8,27 @@ pub mod icons;
 pub mod input;
 pub mod installer;
 pub mod paint;
+pub mod picker;
 pub mod settings;
 pub mod theme;
 pub mod tray;
 pub mod window;
 
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;
+
+/// Set only by tests that run the real launcher off-screen: it then never
+/// touches anything system-wide (startup entry, tray, global hotkeys,
+/// keyboard hook, update checks).
+static HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn headless() -> bool {
+    HEADLESS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub fn set_headless() {
+    HEADLESS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
 
 pub const WINDOW_CLASS: &str = "SIGMA5.Launcher";
 
@@ -67,3 +82,9 @@ pub const WM_APP_DRAG_END: u32 = WM_APP + 23;
 pub const WM_APP_FIDGET_CHAR: u32 = WM_APP + 24;
 /// Fidget mode: the monitor refreshed, draw a frame (posted by the vsync thread).
 pub const WM_APP_FIDGET_FRAME: u32 = WM_APP + 25;
+/// File Search worker result: LPARAM = Box<FilesMsg>.
+pub const WM_APP_FILES: u32 = WM_APP + 26;
+/// Colour picker finished: WPARAM = COLORREF, LPARAM = 1 if a colour was picked.
+pub const WM_APP_COLOR_PICKED: u32 = WM_APP + 27;
+/// Top bar readings: LPARAM = Box<sysinfo::Snapshot>.
+pub const WM_APP_SYSINFO: u32 = WM_APP + 28;

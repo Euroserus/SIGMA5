@@ -39,7 +39,7 @@ use super::{
 use crate::config::{Accent, AppHotkey, CapsMode, Config, ConfigStore, Remap, ThemeMode, UiSize};
 use crate::keys::{self, Target};
 use crate::launch;
-use crate::providers::EXTENSIONS;
+use crate::providers::MODULES;
 use crate::util::{data_dir, wide};
 
 const CLASS: &str = "SIGMA5.Settings";
@@ -54,6 +54,16 @@ const LIST_ROW_H: i32 = 60;
 const ROW_GAP: i32 = 6;
 const CARD_R: i32 = 8;
 const NOTICE_TIMER: usize = 1;
+/// Drives toggle and sidebar animations.
+const ANIM_TIMER: usize = 2;
+const TOGGLE_MS: f32 = 130.0;
+/// Fonts offered first in the font menus (when installed).
+const FONT_PICKS: &[&str] = &[
+    "Segoe UI Variable Text", "Segoe UI", "Bahnschrift", "Inter", "Cascadia Code", "Cascadia Mono", "Consolas",
+    "JetBrains Mono", "Calibri", "Arial", "Verdana", "Tahoma", "Georgia",
+];
+const MENU_FONT_DEFAULT: usize = 1;
+const MENU_FONT_BASE: usize = 1000;
 
 const KEEP_STEPS: &[u64] = &[0, 5, 10, 15, 30, 60, 120, 300, 600];
 const RECENT_MAX: usize = 12;
@@ -82,19 +92,21 @@ enum Page {
     Appearance,
     Hotkeys,
     Keyboard,
-    Extensions,
+    Modules,
+    TopBar,
     About,
 }
 
 impl Page {
-    const ALL: [Page; 6] = [Page::General, Page::Appearance, Page::Hotkeys, Page::Keyboard, Page::Extensions, Page::About];
+    const ALL: [Page; 7] = [Page::General, Page::Appearance, Page::Hotkeys, Page::Keyboard, Page::Modules, Page::TopBar, Page::About];
     fn title(self) -> &'static str {
         match self {
             Page::General => "General",
             Page::Appearance => "Appearance",
             Page::Hotkeys => "App Hotkeys",
             Page::Keyboard => "Keyboard",
-            Page::Extensions => "Extensions",
+            Page::Modules => "Modules",
+            Page::TopBar => "Top Bar",
             Page::About => "About",
         }
     }
@@ -110,7 +122,8 @@ impl Page {
             Page::Appearance => '\u{E790}',
             Page::Hotkeys => '\u{E945}',
             Page::Keyboard => '\u{E765}',
-            Page::Extensions => '\u{EA86}',
+            Page::Modules => '\u{EA86}',
+            Page::TopBar => '\u{E9D9}',
             Page::About => '\u{E946}',
         }
     }
@@ -120,6 +133,12 @@ impl Page {
 enum Stepper {
     KeepQuery,
     Recent,
+    Radius,
+    FontScale,
+    Width,
+    Height,
+    RowH,
+    Frame,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -155,6 +174,62 @@ impl Rec {
 enum MenuFor {
     Remap(usize),
     Draft,
+    Font(FontTarget),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FontTarget {
+    Ui,
+    Search,
+}
+
+/// Appearance colours that can be overridden.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ColorTarget {
+    Accent,
+    Background,
+    Text,
+    Subtext,
+    Selection,
+    Border,
+    Frame,
+}
+
+impl ColorTarget {
+    const ALL: [ColorTarget; 5] = [ColorTarget::Background, ColorTarget::Text, ColorTarget::Subtext, ColorTarget::Selection, ColorTarget::Border];
+    fn label(self) -> &'static str {
+        match self {
+            ColorTarget::Accent => "Custom accent",
+            ColorTarget::Background => "Background",
+            ColorTarget::Text => "Text",
+            ColorTarget::Subtext => "Secondary text",
+            ColorTarget::Selection => "Selection",
+            ColorTarget::Border => "Borders and dividers",
+            ColorTarget::Frame => "Window border colour",
+        }
+    }
+    fn field(self, a: &mut crate::config::Appearance) -> &mut String {
+        match self {
+            ColorTarget::Accent => &mut a.accent_color,
+            ColorTarget::Background => &mut a.background,
+            ColorTarget::Text => &mut a.text,
+            ColorTarget::Subtext => &mut a.subtext,
+            ColorTarget::Selection => &mut a.selection,
+            ColorTarget::Border => &mut a.border,
+            ColorTarget::Frame => &mut a.window_border_color,
+        }
+    }
+    fn current(self, t: &Theme) -> COLORREF {
+        match self {
+            ColorTarget::Accent => t.accent,
+            ColorTarget::Background => t.bg,
+            ColorTarget::Text => t.text,
+            ColorTarget::Subtext => t.subtext,
+            ColorTarget::Selection => t.selection,
+            ColorTarget::Border => t.border,
+            ColorTarget::Frame => t.frame,
+        }
+    }
 }
 
 /// Clickable things; zones are rebuilt on every paint.
@@ -171,7 +246,18 @@ enum Ctl {
     Accent(Accent),
     Size(UiSize),
     Caps(CapsMode),
-    Extension(usize),
+    Module(usize),
+    /// Top bar component (index into `sysinfo::ITEMS`): show/hide, move.
+    TopItem(usize),
+    TopMove(usize, i32),
+    Clock24,
+    ClockSecs,
+    Anims,
+    FontMenu(FontTarget),
+    ColorPick(ColorTarget),
+    ColorPaste(ColorTarget),
+    ColorReset(ColorTarget),
+    ResetLook,
     Button(Btn),
     AddApp,
     DelApp(usize),
@@ -193,16 +279,18 @@ struct Fonts {
 }
 
 impl Fonts {
-    fn create(dpi: u32) -> Self {
+    fn create(dpi: u32, family: &str) -> Self {
         let s = |v: i32| (v * dpi as i32 + 48) / 96;
+        let ui = draw::faces(family, UI_FACES);
+        let display = draw::faces(family, DISPLAY_FACES);
         Self {
-            title: draw::font(s(24), 600, DISPLAY_FACES),
-            label: draw::font(s(14), 400, UI_FACES),
-            small: draw::font(s(12), 400, UI_FACES),
-            kbd: draw::font(s(12), 600, UI_FACES),
+            title: draw::font(s(24), 600, &display),
+            label: draw::font(s(14), 400, &ui),
+            small: draw::font(s(12), 400, &ui),
+            kbd: draw::font(s(12), 600, &ui),
             glyph: draw::font(s(16), 400, ICON_FACES),
             glyph_small: draw::font(s(12), 400, ICON_FACES),
-            brand: draw::font(s(16), 600, DISPLAY_FACES),
+            brand: draw::font(s(16), 600, &display),
         }
     }
     fn destroy(&self) {
@@ -237,6 +325,10 @@ struct Settings {
     backbuf: BackBuffer,
     logo: Option<HICON>,
     big_logo: Option<HICON>,
+    /// Toggle whose knob is sliding, and when it started.
+    toggle_anim: Option<(Ctl, Instant)>,
+    /// Colour being picked from the screen for an appearance setting.
+    pick_target: Option<ColorTarget>,
 }
 
 fn mix(a: COLORREF, b: COLORREF, t: f32) -> COLORREF {
@@ -245,6 +337,12 @@ fn mix(a: COLORREF, b: COLORREF, t: f32) -> COLORREF {
         ((x as f32 + (y as f32 - x as f32) * t).round() as u32) << s
     };
     COLORREF(ch(0) | ch(8) | ch(16))
+}
+
+/// Steps `v` by `step` within `lo..=hi`, snapping to the step grid.
+fn step_in(v: u32, (lo, hi, step): (u32, u32, u32), dir: i32) -> u32 {
+    let snapped = lo + (v.clamp(lo, hi) - lo) / step * step;
+    (snapped as i64 + dir as i64 * step as i64).clamp(lo as i64, hi as i64) as u32
 }
 
 fn key_down(vk: VIRTUAL_KEY) -> bool {
@@ -298,7 +396,7 @@ impl Settings {
     }
 
     fn apply_theme(&mut self) {
-        self.theme = theme::resolve(self.cfg().theme, self.cfg().accent);
+        self.theme = theme::resolve(self.cfg().theme, self.cfg().accent, &self.cfg().appearance);
         let t = self.theme;
         unsafe {
             let dark: i32 = t.dark as i32;
@@ -312,6 +410,8 @@ impl Settings {
     /// Saves settings and tells the launcher to re-apply them.
     fn commit(&mut self) {
         self.store.save();
+        self.fonts.destroy();
+        self.fonts = Fonts::create(self.dpi, &self.store.config.appearance.font.clone());
         unsafe {
             let _ = PostMessageW(Some(self.launcher), WM_APP_CONFIG_CHANGED, WPARAM(0), LPARAM(0));
         }
@@ -327,6 +427,65 @@ impl Settings {
 
     fn error_for(&self, pred: impl Fn(Rec) -> bool) -> Option<String> {
         self.error.as_ref().filter(|(r, _)| pred(*r)).map(|(_, e)| e.clone())
+    }
+
+    // ----- animation ------------------------------------------------------------
+
+    fn animations(&self) -> bool {
+        self.cfg().appearance.animations
+    }
+
+    fn animating(&self) -> bool {
+        let live = |t0: Instant, ms: f32| (t0.elapsed().as_millis() as f32) < ms;
+        self.toggle_anim.is_some_and(|(_, t)| live(t, TOGGLE_MS))
+    }
+
+    fn kick_anim(&self) {
+        unsafe {
+            SetTimer(Some(self.hwnd), ANIM_TIMER, 15, None);
+        }
+    }
+
+    /// Eased progress of an animation that started at `t0`, or None when done.
+    fn progress(t0: Instant, ms: f32) -> Option<f32> {
+        let p = t0.elapsed().as_millis() as f32 / ms;
+        (p < 1.0).then(|| 1.0 - (1.0 - p).powi(3))
+    }
+
+    // ----- appearance -----------------------------------------------------------
+
+    fn on_font_menu(&mut self, which: FontTarget, cmd: usize, families: &[String]) {
+        let name = match cmd {
+            0 => return,
+            MENU_FONT_DEFAULT => String::new(),
+            c if c >= MENU_FONT_BASE => match families.get(c - MENU_FONT_BASE) {
+                Some(f) => f.clone(),
+                None => return,
+            },
+            _ => return,
+        };
+        let a = &mut self.store.config.appearance;
+        match which {
+            FontTarget::Ui => a.font = name,
+            FontTarget::Search => a.search_font = name,
+        }
+        self.commit();
+    }
+
+    fn set_color(&mut self, target: ColorTarget, value: String) {
+        *target.field(&mut self.store.config.appearance) = value;
+        self.commit();
+    }
+
+    fn on_color_picked(&mut self, colorref: u32, ok: bool) {
+        let Some(target) = self.pick_target.take() else { return };
+        if ok {
+            self.set_color(target, crate::colors::Color::from_colorref(colorref).hex());
+        }
+        unsafe {
+            let _ = SetForegroundWindow(self.hwnd);
+        }
+        self.invalidate();
     }
 
     // ----- recording ----------------------------------------------------------
@@ -396,10 +555,8 @@ impl Settings {
                 if hotkey::normalize(&current).as_deref() == Some(spec.as_str()) {
                     return;
                 }
-                if !hotkey::is_free(self.launcher, &spec) {
-                    self.error = Some((r, format!("{spec} is already used by another app")));
-                    return;
-                }
+                // Shortcuts another app already owns are taken over by SIGMA5's
+                // keyboard hook, so they don't need to be free.
                 let c = &mut self.store.config;
                 match r {
                     Rec::Launcher => c.hotkey = spec,
@@ -474,6 +631,7 @@ impl Settings {
                 let Some(id) = keys::id(from) else { return };
                 self.store.config.remaps.push(Remap { from: id.to_string(), to: spec });
             }
+            MenuFor::Font(_) => return,
         }
         self.error = None;
         self.commit();
@@ -510,6 +668,14 @@ impl Settings {
             if ctl != Ctl::Rec(r) {
                 self.stop_recording();
             }
+        }
+        let is_toggle = matches!(
+            ctl,
+            Ctl::AutoUpdate | Ctl::WindowsKey | Ctl::StartWithWindows | Ctl::Module(_) | Ctl::TopItem(_) | Ctl::Clock24 | Ctl::ClockSecs | Ctl::Anims
+        );
+        if is_toggle && self.animations() {
+            self.toggle_anim = Some((ctl, Instant::now()));
+            self.kick_anim();
         }
         match ctl {
             Ctl::Nav(p) => {
@@ -559,6 +725,17 @@ impl Settings {
                     Stepper::Recent => {
                         c.recent_count = (c.recent_count as i32 + dir).clamp(0, RECENT_MAX as i32) as usize;
                     }
+                    Stepper::Radius => {
+                        let steps = crate::config::RADIUS_STEPS;
+                        let r = c.appearance.corner_radius;
+                        let i = steps.iter().position(|&v| v >= r).unwrap_or(steps.len() - 1) as i32;
+                        c.appearance.corner_radius = steps[(i + dir).clamp(0, steps.len() as i32 - 1) as usize];
+                    }
+                    Stepper::FontScale => c.appearance.font_scale = step_in(c.appearance.font_scale, crate::config::FONT_SCALE, dir),
+                    Stepper::Width => c.appearance.width = step_in(c.appearance.width, crate::config::WIDTH, dir),
+                    Stepper::Height => c.appearance.height = step_in(c.appearance.height, crate::config::HEIGHT, dir),
+                    Stepper::RowH => c.appearance.row_height = step_in(c.appearance.row_height, crate::config::ROW_HEIGHT, dir),
+                    Stepper::Frame => c.appearance.window_border = step_in(c.appearance.window_border, crate::config::BORDER, dir),
                 }
                 self.commit();
             }
@@ -578,14 +755,65 @@ impl Settings {
                 self.store.config.caps_lock = m;
                 self.commit();
             }
-            Ctl::Extension(i) => {
-                let id = EXTENSIONS[i].id.to_string();
-                let d = &mut self.store.config.disabled_extensions;
+            Ctl::Module(i) => {
+                let id = MODULES[i].id.to_string();
+                let d = &mut self.store.config.disabled_modules;
                 if let Some(pos) = d.iter().position(|x| *x == id) {
                     d.remove(pos);
                 } else {
                     d.push(id);
                 }
+                self.commit();
+            }
+            Ctl::TopItem(i) => {
+                let id = crate::sysinfo::ITEMS[i].id.to_string();
+                let items = &mut self.store.config.top_bar.items;
+                if let Some(pos) = items.iter().position(|x| *x == id) {
+                    items.remove(pos);
+                } else {
+                    items.push(id);
+                }
+                self.commit();
+            }
+            Ctl::TopMove(i, dir) => {
+                let id = crate::sysinfo::ITEMS[i].id;
+                let items = &mut self.store.config.top_bar.items;
+                if let Some(pos) = items.iter().position(|x| x == id) {
+                    let to = pos as i32 + dir;
+                    if to >= 0 && (to as usize) < items.len() {
+                        items.swap(pos, to as usize);
+                        self.commit();
+                    }
+                }
+            }
+            Ctl::Anims => {
+                self.store.config.appearance.animations ^= true;
+                self.commit();
+            }
+            Ctl::FontMenu(which) => self.request_menu(MenuFor::Font(which)),
+            Ctl::ColorPick(target) => {
+                self.pick_target = Some(target);
+                super::picker::start(self.hwnd, self.theme.accent);
+            }
+            Ctl::ColorPaste(target) => {
+                let text = crate::util::clipboard_text(self.hwnd).unwrap_or_default();
+                let t = text.trim();
+                match crate::colors::parse(t).or_else(|| crate::colors::parse(&format!("#{t}"))) {
+                    Some(c) => self.set_color(target, c.hex()),
+                    None => self.set_notice(Btn::Reset, "The clipboard doesn't hold a colour (e.g. #FF8800)"),
+                }
+            }
+            Ctl::ColorReset(target) => self.set_color(target, String::new()),
+            Ctl::ResetLook => {
+                self.store.config.appearance = crate::config::Appearance::default();
+                self.commit();
+            }
+            Ctl::Clock24 => {
+                self.store.config.top_bar.clock_24h ^= true;
+                self.commit();
+            }
+            Ctl::ClockSecs => {
+                self.store.config.top_bar.show_seconds ^= true;
                 self.commit();
             }
             Ctl::AddApp => unsafe {
@@ -701,7 +929,7 @@ impl Settings {
     fn on_dpi(&mut self, dpi: u32) {
         self.dpi = dpi;
         self.fonts.destroy();
-        self.fonts = Fonts::create(dpi);
+        self.fonts = Fonts::create(dpi, &self.cfg().appearance.font.clone());
         self.load_logos();
         self.invalidate();
     }
@@ -728,7 +956,22 @@ impl Settings {
         let (w, h) = (rc.right, rc.bottom);
         if w > 0 && h > 0 {
             let dc = self.backbuf.ensure(hdc, w, h);
+            self.render(dc, w, h);
+            unsafe {
+                let _ = BitBlt(hdc, 0, 0, w, h, Some(dc), 0, 0, SRCCOPY);
+            }
+        }
+        unsafe {
+            let _ = EndPaint(self.hwnd, &ps);
+        }
+    }
+
+    /// Draws the whole window into `dc`.
+    fn render(&mut self, dc: HDC, w: i32, h: i32) {
+        let rc = RECT { left: 0, top: 0, right: w, bottom: h };
+        {
             self.zones.clear();
+            draw::set_corner_cap(self.s(self.theme.radius));
             fill(dc, &rc, self.theme.bg);
 
             // Content first (scrolls), then the fixed sidebar on top.
@@ -745,7 +988,8 @@ impl Settings {
                 Page::Appearance => self.draw_appearance(dc, x0, x1, y),
                 Page::Hotkeys => self.draw_hotkeys(dc, x0, x1, y),
                 Page::Keyboard => self.draw_keyboard(dc, x0, x1, y),
-                Page::Extensions => self.draw_extensions(dc, x0, x1, y),
+                Page::Modules => self.draw_modules(dc, x0, x1, y),
+                Page::TopBar => self.draw_top_bar(dc, x0, x1, y),
                 Page::About => self.draw_about(dc, x0, x1, y),
             };
             let new_h = bottom - off + self.s(24);
@@ -769,12 +1013,6 @@ impl Settings {
                 let x = w - self.s(6);
                 round_rect(dc, &RECT { left: x - self.s(3), top: y, right: x, bottom: y + thumb }, self.s(3), self.theme.scrollbar);
             }
-            unsafe {
-                let _ = BitBlt(hdc, 0, 0, w, h, Some(dc), 0, 0, SRCCOPY);
-            }
-        }
-        unsafe {
-            let _ = EndPaint(self.hwnd, &ps);
         }
     }
 
@@ -799,9 +1037,10 @@ impl Settings {
             let rc = RECT { left: self.s(12), top: y, right: sw - self.s(12), bottom: y + self.s(38) };
             let ctl = Ctl::Nav(p);
             if self.page == p {
-                round_rect(dc, &rc, self.s(6), t.selection);
-                let bar = RECT { left: rc.left, top: rc.top + self.s(11), right: rc.left + self.s(3), bottom: rc.bottom - self.s(11) };
-                round_rect(dc, &bar, self.s(2), t.accent);
+                let hl = rc;
+                round_rect(dc, &hl, self.s(6), t.selection);
+                let bar = RECT { left: hl.left, top: hl.top, right: hl.left + self.s(3), bottom: hl.bottom };
+                fill(dc, &bar, t.accent);
             } else if self.hover == Some(ctl) {
                 round_rect(dc, &rc, self.s(6), mix(t.bg, t.selection, 0.6));
             }
@@ -856,16 +1095,16 @@ impl Settings {
         let (tw, th) = (self.s(40), self.s(20));
         let track = RECT { left: right - tw, top: cy - th / 2, right, bottom: cy - th / 2 + th };
         let hovered = self.hover == Some(ctl);
-        let col = if on {
-            if hovered { mix(t.accent, WHITE, 0.12) } else { t.accent }
-        } else if hovered {
-            mix(t.toggle_off, t.text, 0.15)
-        } else {
-            t.toggle_off
-        };
-        round_rect(dc, &track, th, col);
+        // 0 = off, 1 = on; slides between the two after a click.
+        let mut k = if on { 1.0 } else { 0.0 };
+        if let Some(e) = self.toggle_anim.filter(|(c, _)| *c == ctl).and_then(|(_, t0)| Self::progress(t0, TOGGLE_MS)) {
+            k = if on { e } else { 1.0 - e };
+        }
+        let on_c = if hovered { mix(t.accent, WHITE, 0.12) } else { t.accent };
+        let off_c = if hovered { mix(t.toggle_off, t.text, 0.15) } else { t.toggle_off };
+        round_rect(dc, &track, th, mix(off_c, on_c, k));
         let d = self.s(14);
-        let kx = if on { track.right - th / 2 } else { track.left + th / 2 };
+        let kx = track.left + th / 2 + ((tw - th) as f32 * k).round() as i32;
         circle(dc, kx, cy, d, WHITE);
         let label = if on { "On" } else { "Off" };
         let lw = text_width(dc, label, self.fonts.label);
@@ -996,11 +1235,14 @@ impl Settings {
     }
 
     fn button(&mut self, dc: HDC, right: i32, cy: i32, label: &str, btn: Btn, danger: bool) -> i32 {
+        self.ctl_button(dc, right, cy, label, Ctl::Button(btn), danger)
+    }
+
+    fn ctl_button(&mut self, dc: HDC, right: i32, cy: i32, label: &str, ctl: Ctl, danger: bool) -> i32 {
         let t = self.theme;
         let h = self.s(32);
-        let w = text_width(dc, label, self.fonts.label) + self.s(36);
+        let w = text_width(dc, label, self.fonts.label) + self.s(28);
         let rc = RECT { left: right - w, top: cy - h / 2, right, bottom: cy - h / 2 + h };
-        let ctl = Ctl::Button(btn);
         let bg = if self.hover == Some(ctl) { t.hover } else { t.kbd_bg };
         round_rect(dc, &rc, self.s(6), bg);
         text(dc, label, &rc, self.fonts.label, if danger { t.warn } else { t.text }, DT_CENTER);
@@ -1041,6 +1283,11 @@ impl Settings {
     /// App icon from the shared cache, or a letter tile.
     fn app_icon(&self, dc: HDC, rc: &RECT, id: &str, name: &str) {
         let size = rc.right - rc.left;
+        if let Some((_, _, glyph, _)) = crate::providers::commands::find(id) {
+            round_rect(dc, rc, self.s(6), self.theme.accent);
+            text(dc, &glyph.to_string(), rc, self.fonts.glyph_small, WHITE, DT_CENTER);
+            return;
+        }
         if let Some(ic) = icons::get(id) {
             unsafe {
                 let mem = CreateCompatibleDC(Some(dc));
@@ -1129,31 +1376,157 @@ impl Settings {
         self.note(dc, x0, x1, tip_y, "Tip: press Ctrl+, in the launcher to open settings. Ctrl+Tab switches pages here.", t.subtext)
     }
 
+    /// A small section heading; returns the y below it.
+    fn section(&self, dc: HDC, x0: i32, x1: i32, y: i32, title: &str) -> i32 {
+        let r = RECT { left: x0 + self.s(4), top: y, right: x1, bottom: y + self.s(26) };
+        text(dc, title, &r, self.fonts.kbd, self.theme.subtext, DT_LEFT);
+        y + self.s(30)
+    }
+
+    /// A colour swatch with a border.
+    fn swatch(&self, dc: HDC, right: i32, cy: i32, c: COLORREF) -> i32 {
+        let d = self.s(24);
+        let rc = RECT { left: right - d, top: cy - d / 2, right, bottom: cy - d / 2 + d };
+        bordered_round_rect(dc, &rc, self.s(5), 1, c, self.theme.border);
+        rc.left
+    }
+
+    /// The font chooser: the family's name, drawn in that family.
+    fn font_box(&mut self, dc: HDC, right: i32, cy: i32, family: &str, ctl: Ctl) -> i32 {
+        let t = self.theme;
+        let label = if family.is_empty() { "Default (Segoe UI Variable)".to_string() } else { family.to_string() };
+        let font = draw::font(self.s(14), 400, &draw::faces(family, UI_FACES));
+        let w = (text_width(dc, &label, font) + self.s(52)).max(self.s(220));
+        let h = self.s(34);
+        let rc = RECT { left: right - w, top: cy - h / 2, right, bottom: cy - h / 2 + h };
+        let fill_c = if self.hover == Some(ctl) { t.hover } else { t.card };
+        bordered_round_rect(dc, &rc, self.s(6), 1, fill_c, t.card_border);
+        text(dc, &label, &RECT { left: rc.left + self.s(12), right: rc.right - self.s(30), ..rc }, font, t.text, DT_LEFT | DT_END_ELLIPSIS);
+        text(dc, "\u{E70D}", &RECT { left: rc.right - self.s(30), ..rc }, self.fonts.glyph_small, t.subtext, DT_CENTER);
+        unsafe {
+            let _ = DeleteObject(font.into());
+        }
+        self.zones.push((rc, ctl));
+        rc.left
+    }
+
+    /// One colour setting: swatch, Pick / Paste / Reset.
+    fn color_row(&mut self, dc: HDC, x0: i32, x1: i32, y: i32, target: ColorTarget, desc: &str) -> i32 {
+        let t = self.theme;
+        let right = x1 - self.s(18);
+        let rc = self.card(dc, x0, x1, y, self.s(LIST_ROW_H));
+        let cy = (rc.top + rc.bottom) / 2;
+        let set = !target.field(&mut self.store.config.appearance.clone()).is_empty();
+        let mut left = right;
+        if set {
+            left = self.ctl_button(dc, left, cy, "Reset", Ctl::ColorReset(target), false) - self.s(6);
+        }
+        left = self.ctl_button(dc, left, cy, "Paste", Ctl::ColorPaste(target), false) - self.s(6);
+        left = self.ctl_button(dc, left, cy, "Pick", Ctl::ColorPick(target), false) - self.s(12);
+        let cur = target.current(&t);
+        left = self.swatch(dc, left, cy, cur) - self.s(10);
+        let hex = crate::colors::Color::from_colorref(cur.0).hex();
+        let d = if set { format!("{hex} · custom") } else if desc.is_empty() { format!("{hex} · from the theme") } else { format!("{hex} · {desc}") };
+        self.labels(dc, &rc, x0 + self.s(20), left - self.s(12), target.label(), &d, t.subtext);
+        rc.bottom + self.s(ROW_GAP)
+    }
+
     fn draw_appearance(&mut self, dc: HDC, x0: i32, x1: i32, y: i32) -> i32 {
         let t = self.theme;
         let ix = x0 + self.s(20);
         let right = x1 - self.s(18);
         let rh = self.s(ROW_H);
+        let a = self.cfg().appearance.sane();
+        let gap = self.s(ROW_GAP);
+        let mut y = y - self.s(6);
 
-        let rc = self.card(dc, x0, x1, self.row_y(y, 0), rh);
+        // Theme
+        y = self.section(dc, x0, x1, y, "THEME");
+        let rc = self.card(dc, x0, x1, y, rh);
         let cur = self.cfg().theme;
         let opts: Vec<(&str, Ctl, bool)> = ThemeMode::ALL.iter().map(|m| (m.label(), Ctl::Theme(*m), *m == cur)).collect();
         let left = self.segmented(dc, right, (rc.top + rc.bottom) / 2, &opts);
         self.labels(dc, &rc, ix, left - self.s(16), "Theme", "Follow Windows or pick one", t.subtext);
-
-        let rc = self.card(dc, x0, x1, self.row_y(y, 1), rh);
+        let rc = self.card(dc, x0, x1, rc.bottom + gap, rh);
         let left = self.swatches(dc, right, (rc.top + rc.bottom) / 2);
         let shown = match self.hover {
             Some(Ctl::Accent(a)) => a,
             _ => self.cfg().accent,
         };
-        self.labels(dc, &rc, ix, left - self.s(16), "Accent color", accent_name(shown), t.subtext);
+        let desc = if a.accent_color.is_empty() { accent_name(shown).to_string() } else { "Overridden by the custom accent below".into() };
+        self.labels(dc, &rc, ix, left - self.s(16), "Accent color", &desc, t.subtext);
+        y = self.color_row(dc, x0, x1, rc.bottom + gap, ColorTarget::Accent, "pick any colour for the accent");
 
-        let rc = self.card(dc, x0, x1, self.row_y(y, 2), rh);
+        // Shape & motion
+        y = self.section(dc, x0, x1, y + self.s(10), "SHAPE AND MOTION");
+        let rc = self.card(dc, x0, x1, y, rh);
+        let r = a.corner_radius;
+        let steps = crate::config::RADIUS_STEPS;
+        let label = if r == 0 { "Square".to_string() } else { format!("{r} px") };
+        let left = self.stepper(dc, right, (rc.top + rc.bottom) / 2, &label, Stepper::Radius, r <= steps[0], r >= *steps.last().unwrap());
+        self.labels(dc, &rc, ix, left - self.s(16), "Corners", "Square, or rounded by this much", t.subtext);
+        let rc = self.card(dc, x0, x1, rc.bottom + gap, rh);
+        let left = self.toggle(dc, right, (rc.top + rc.bottom) / 2, a.animations, Ctl::Anims);
+        self.labels(dc, &rc, ix, left - self.s(16), "Animations", "Copy pulses, a flash on launch, sliding toggles", t.subtext);
+        y = rc.bottom + gap;
+
+        // Window border
+        y = self.section(dc, x0, x1, y + self.s(10), "WINDOW BORDER");
+        let rc = self.card(dc, x0, x1, y, rh);
+        let bw = a.window_border;
+        let label = if bw == 0 { "Off".to_string() } else { format!("{bw} px") };
+        let left = self.stepper(dc, right, (rc.top + rc.bottom) / 2, &label, Stepper::Frame, bw == 0, bw >= crate::config::BORDER.1);
+        self.labels(dc, &rc, ix, left - self.s(16), "Thickness", "A coloured frame round the launcher", t.subtext);
+        y = self.color_row(dc, x0, x1, rc.bottom + gap, ColorTarget::Frame, "the accent unless you pick one");
+
+        // Text
+        y = self.section(dc, x0, x1, y + self.s(10), "TEXT");
+        let rc = self.card(dc, x0, x1, y, rh);
+        let left = self.font_box(dc, right, (rc.top + rc.bottom) / 2, &a.font, Ctl::FontMenu(FontTarget::Ui));
+        self.labels(dc, &rc, ix, left - self.s(16), "Interface font", "Results, footer and settings", t.subtext);
+        let rc = self.card(dc, x0, x1, rc.bottom + gap, rh);
+        let left = self.font_box(dc, right, (rc.top + rc.bottom) / 2, &a.search_font, Ctl::FontMenu(FontTarget::Search));
+        self.labels(dc, &rc, ix, left - self.s(16), "Search font", "The search box and calculator answers", t.subtext);
+        let rc = self.card(dc, x0, x1, rc.bottom + gap, rh);
+        let (lo, hi, _) = crate::config::FONT_SCALE;
+        let left = self.stepper(dc, right, (rc.top + rc.bottom) / 2, &format!("{}%", a.font_scale), Stepper::FontScale, a.font_scale <= lo, a.font_scale >= hi);
+        self.labels(dc, &rc, ix, left - self.s(16), "Text size", "In the launcher", t.subtext);
+        y = rc.bottom + gap;
+
+        // Size
+        y = self.section(dc, x0, x1, y + self.s(10), "SIZE");
+        let rc = self.card(dc, x0, x1, y, rh);
         let cur = self.cfg().size;
         let opts: Vec<(&str, Ctl, bool)> = UiSize::ALL.iter().map(|z| (z.label(), Ctl::Size(*z), *z == cur)).collect();
         let left = self.segmented(dc, right, (rc.top + rc.bottom) / 2, &opts);
-        self.labels(dc, &rc, ix, left - self.s(16), "Launcher size", "Window and text scale", t.subtext);
+        self.labels(dc, &rc, ix, left - self.s(16), "Overall scale", "Everything in the launcher, together", t.subtext);
+        let mut bottom = rc.bottom;
+        for (label, desc, v, range, which) in [
+            ("Width", "Launcher width", a.width, crate::config::WIDTH, Stepper::Width),
+            ("Height", "Launcher height (without the top bar)", a.height, crate::config::HEIGHT, Stepper::Height),
+            ("Row height", "Height of each result", a.row_height, crate::config::ROW_HEIGHT, Stepper::RowH),
+        ] {
+            let rc = self.card(dc, x0, x1, bottom + gap, rh);
+            let left = self.stepper(dc, right, (rc.top + rc.bottom) / 2, &format!("{v} px"), which, v <= range.0, v >= range.1);
+            self.labels(dc, &rc, ix, left - self.s(16), label, desc, t.subtext);
+            bottom = rc.bottom;
+        }
+        y = bottom + gap;
+
+        // Colours
+        y = self.section(dc, x0, x1, y + self.s(10), "COLOURS");
+        for target in ColorTarget::ALL {
+            let desc = if target == ColorTarget::Background { "others adapt to it" } else { "" };
+            y = self.color_row(dc, x0, x1, y, target, desc);
+        }
+        y = self.note(dc, x0, x1, y, "Pick takes a colour from anywhere on screen; Paste reads a hex code like #1E1E2E.", t.subtext) + self.s(10);
+        let rc = self.card(dc, x0, x1, y, rh);
+        let left = self.ctl_button(dc, right, (rc.top + rc.bottom) / 2, "Reset", Ctl::ResetLook, true);
+        let (d, c) = match &self.notice {
+            Some((Btn::Reset, msg, until)) if Instant::now() < *until => (msg.clone(), t.warn),
+            _ => ("Fonts, sizes, colours and corners back to the defaults".to_string(), t.subtext),
+        };
+        self.labels(dc, &rc, ix, left - self.s(16), "Reset appearance", &d, c);
         rc.bottom
     }
 
@@ -1162,7 +1535,7 @@ impl Settings {
         let right = x1 - self.s(14);
         let mut y = self.note(
             dc, x0, x1, y - self.s(8),
-            "Launch the app, bring it to the front, or minimise it if it's already in front.",
+            "Apps: launch, bring to front, or minimise. Commands (Pick Colour, Search Files…) run directly.",
             t.subtext,
         ) + self.s(10);
 
@@ -1199,7 +1572,7 @@ impl Settings {
             y = rc.bottom + self.s(ROW_GAP);
         }
 
-        let bottom = self.add_button(dc, x0, x1, y, "Add app hotkey", Ctl::AddApp);
+        let bottom = self.add_button(dc, x0, x1, y, "Add app or command hotkey", Ctl::AddApp);
         let tip = if self.cfg().caps_lock == CapsMode::Hyper {
             "Caps Lock is Hyper: hold Caps and press a letter to record Ctrl+Alt+Shift+letter."
         } else {
@@ -1280,23 +1653,76 @@ impl Settings {
         self.note(dc, x0, x1, bottom + self.s(8), "Remaps don't apply in apps running as administrator (Windows blocks it).", t.subtext)
     }
 
-    fn draw_extensions(&mut self, dc: HDC, x0: i32, x1: i32, y: i32) -> i32 {
+    fn draw_modules(&mut self, dc: HDC, x0: i32, x1: i32, y: i32) -> i32 {
         let t = self.theme;
         let right = x1 - self.s(18);
         let rh = self.s(ROW_H);
-        for (i, ext) in EXTENSIONS.iter().enumerate() {
+        for (i, ext) in MODULES.iter().enumerate() {
             let rc = self.card(dc, x0, x1, self.row_y(y, i as i32), rh);
             let cy = (rc.top + rc.bottom) / 2;
             let tile = self.s(32);
             let tr = RECT { left: x0 + self.s(18), top: cy - tile / 2, right: x0 + self.s(18) + tile, bottom: cy - tile / 2 + tile };
-            let enabled = self.cfg().extension_enabled(ext.id);
+            let enabled = self.cfg().module_enabled(ext.id);
             round_rect(dc, &tr, self.s(7), if enabled { t.accent } else { t.toggle_off });
             text(dc, &ext.glyph.to_string(), &tr, self.fonts.glyph, WHITE, DT_CENTER);
-            let left = self.toggle(dc, right, cy, enabled, Ctl::Extension(i));
+            let left = self.toggle(dc, right, cy, enabled, Ctl::Module(i));
             self.labels(dc, &rc, tr.right + self.s(14), left - self.s(16), ext.name, ext.description, t.subtext);
         }
-        let ny = self.row_y(y, EXTENSIONS.len() as i32) + self.s(6);
-        self.note(dc, x0, x1, ny, "More extensions, such as Google Search and Ask AI, are on the way.", t.subtext)
+        let ny = self.row_y(y, MODULES.len() as i32) + self.s(6);
+        self.note(dc, x0, x1, ny, "Turned-off modules use no memory or CPU. More are on the way.", t.subtext)
+    }
+
+    fn draw_top_bar(&mut self, dc: HDC, x0: i32, x1: i32, y: i32) -> i32 {
+        use crate::sysinfo::ITEMS;
+        let t = self.theme;
+        let right = x1 - self.s(18);
+        let ix = x0 + self.s(20);
+        let rh = self.s(ROW_H);
+        let on = self.cfg().module_enabled("topbar");
+        let mut y = self.note(
+            dc, x0, x1, y - self.s(8),
+            if on { "Shown above the search box, left to right. Readings update while SIGMA5 is open." }
+            else { "The Top Bar module is off (Settings › Modules), so these aren't shown." },
+            if on { t.subtext } else { t.warn },
+        ) + self.s(10);
+
+        // Shown components in their order, then the rest.
+        let shown: Vec<usize> = self.cfg().top_bar.items.iter().filter_map(|id| ITEMS.iter().position(|i| i.id == id)).collect();
+        let hidden: Vec<usize> = (0..ITEMS.len()).filter(|i| !shown.contains(i)).collect();
+        let n = shown.len();
+        for (pos, &i) in shown.iter().chain(hidden.iter()).enumerate() {
+            let info = &ITEMS[i];
+            let enabled = pos < n;
+            let rc = self.card(dc, x0, x1, y, self.s(LIST_ROW_H));
+            let cy = (rc.top + rc.bottom) / 2;
+            let tile = self.s(30);
+            let tr = RECT { left: x0 + self.s(16), top: cy - tile / 2, right: x0 + self.s(16) + tile, bottom: cy - tile / 2 + tile };
+            round_rect(dc, &tr, self.s(4), if enabled { t.accent } else { t.toggle_off });
+            text(dc, &info.glyph.to_string(), &tr, self.fonts.glyph_small, WHITE, DT_CENTER);
+            let mut left = self.toggle(dc, right, cy, enabled, Ctl::TopItem(i));
+            if enabled {
+                let down = self.icon_button(dc, left - self.s(10), cy, '\u{E70D}', Ctl::TopMove(i, 1));
+                left = self.icon_button(dc, down - self.s(2), cy, '\u{E70E}', Ctl::TopMove(i, -1));
+            }
+            let desc = match info.id {
+                "cpu_temp" => "Where Windows exposes an ACPI thermal zone; many laptops don't",
+                "gpu_temp" => "NVIDIA GPUs (through the driver)",
+                "net" => "Download and upload, all adapters",
+                "disk" => "System drive",
+                _ => "",
+            };
+            self.labels(dc, &rc, tr.right + self.s(14), left - self.s(12), info.name, desc, t.subtext);
+            y = rc.bottom + self.s(ROW_GAP);
+        }
+
+        y += self.s(12);
+        let rc = self.card(dc, x0, x1, y, rh);
+        let left = self.toggle(dc, right, (rc.top + rc.bottom) / 2, self.cfg().top_bar.clock_24h, Ctl::Clock24);
+        self.labels(dc, &rc, ix, left - self.s(16), "24-hour clock", "Otherwise 12-hour with AM/PM", t.subtext);
+        let rc = self.card(dc, x0, x1, rc.bottom + self.s(ROW_GAP), rh);
+        let left = self.toggle(dc, right, (rc.top + rc.bottom) / 2, self.cfg().top_bar.show_seconds, Ctl::ClockSecs);
+        self.labels(dc, &rc, ix, left - self.s(16), "Show seconds", "", t.subtext);
+        rc.bottom
     }
 
     fn draw_about(&mut self, dc: HDC, x0: i32, x1: i32, y: i32) -> i32 {
@@ -1385,6 +1811,45 @@ fn show_to_menu(hwnd: HWND) -> usize {
     }
 }
 
+/// Font family menu: Default, common picks, then every installed family.
+/// Returns MENU_FONT_DEFAULT, MENU_FONT_BASE + index into `families`, or 0.
+fn show_font_menu(hwnd: HWND, families: &[String], current: &str) -> usize {
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return 0 };
+        let add = |m: HMENU, id: usize, label: &str, checked: bool| {
+            let w = wide(label);
+            let flags = if checked { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(m, flags, id, PCWSTR(w.as_ptr()));
+        };
+        add(menu, MENU_FONT_DEFAULT, "Default (Segoe UI Variable)", current.is_empty());
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        for pick in FONT_PICKS {
+            if let Some(i) = families.iter().position(|f| f.eq_ignore_ascii_case(pick)) {
+                add(menu, MENU_FONT_BASE + i, pick, current.eq_ignore_ascii_case(pick));
+            }
+        }
+        if let Ok(all) = CreatePopupMenu() {
+            for (i, f) in families.iter().enumerate() {
+                // Long lists break into columns instead of scrolling forever.
+                let w = wide(f);
+                let mut flags = if f.eq_ignore_ascii_case(current) { MF_STRING | MF_CHECKED } else { MF_STRING };
+                if i > 0 && i % 40 == 0 {
+                    flags |= MF_MENUBARBREAK;
+                }
+                let _ = AppendMenuW(all, flags, MENU_FONT_BASE + i, PCWSTR(w.as_ptr()));
+            }
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let label = wide("All fonts");
+            let _ = AppendMenuW(menu, MF_POPUP, all.0 as usize, PCWSTR(label.as_ptr()));
+        }
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, None, hwnd, None);
+        let _ = DestroyMenu(menu);
+        cmd.0 as usize
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Window management.
 
@@ -1450,13 +1915,13 @@ pub fn open(launcher: HWND) {
         };
 
         let store = ConfigStore::load();
-        let theme = theme::resolve(store.config.theme, store.config.accent);
+        let theme = theme::resolve(store.config.theme, store.config.accent, &store.config.appearance);
         let mut st = Box::new(Settings {
             hwnd,
             launcher,
             dpi,
             theme,
-            fonts: Fonts::create(dpi),
+            fonts: Fonts::create(dpi, &store.config.appearance.font),
             store,
             page: Page::General,
             zones: Vec::new(),
@@ -1475,6 +1940,8 @@ pub fn open(launcher: HWND) {
             backbuf: BackBuffer::default(),
             logo: None,
             big_logo: None,
+            toggle_anim: None,
+            pick_target: None,
         });
         st.load_logos();
         st.apply_theme();
@@ -1517,9 +1984,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_APP_SETTINGS_MENU => {
             let which = unsafe { (*ptr).pending_menu.take() };
-            if let Some(which) = which {
-                let cmd = show_to_menu(hwnd); // modal loop: state not borrowed
-                unsafe { (*ptr).on_menu(which, cmd) };
+            match which {
+                Some(MenuFor::Font(ft)) => {
+                    let families = draw::font_families();
+                    let cur = unsafe {
+                        let a = &(*ptr).store.config.appearance;
+                        if ft == FontTarget::Ui { a.font.clone() } else { a.search_font.clone() }
+                    };
+                    let cmd = show_font_menu(hwnd, &families, &cur); // modal loop: state not borrowed
+                    unsafe { (*ptr).on_font_menu(ft, cmd, &families) };
+                }
+                Some(which) => {
+                    let cmd = show_to_menu(hwnd); // modal loop: state not borrowed
+                    unsafe { (*ptr).on_menu(which, cmd) };
+                }
+                None => {}
             }
             return LRESULT(0);
         }
@@ -1609,6 +2088,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             st.stop_recording();
             LRESULT(0)
         }
+        super::WM_APP_COLOR_PICKED => {
+            st.on_color_picked(wp.0 as u32, lp.0 != 0);
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == ANIM_TIMER => {
+            if !st.animating() {
+                st.toggle_anim = None;
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), ANIM_TIMER);
+                }
+            }
+            st.invalidate();
+            LRESULT(0)
+        }
         WM_TIMER => {
             if wp.0 == NOTICE_TIMER {
                 unsafe {
@@ -1624,5 +2117,72 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+#[cfg(test)]
+mod snapshots {
+    use super::*;
+
+    /// Renders every settings page off-screen (private desktop, temporary
+    /// %APPDATA%): `SIGMA5_SNAP_DIR=<dir> cargo test --release settings_snapshots -- --ignored`
+    #[test]
+    #[ignore]
+    fn settings_snapshots() {
+        let Ok(dir) = std::env::var("SIGMA5_SNAP_DIR") else { return };
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn CreateDesktopW(name: PCWSTR, dev: PCWSTR, mode: *const core::ffi::c_void, flags: u32, access: u32, sa: *const core::ffi::c_void) -> isize;
+            fn SetThreadDesktop(desk: isize) -> i32;
+        }
+        crate::ui::set_headless();
+        let tmp = std::env::temp_dir().join(format!("sigma5-settings-snap-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("SIGMA5")).unwrap();
+        std::fs::write(
+            tmp.join("SIGMA5").join("config.toml"),
+            "theme = \"dark\"
+[[app_hotkeys]]
+hotkey = \"Ctrl+Alt+Shift+P\"
+app = \"cmd:PickColor\"
+name = \"Pick Colour\"
+",
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("APPDATA", &tmp);
+        }
+        std::thread::spawn(move || unsafe {
+            let desk = CreateDesktopW(windows::core::w!("SIGMA5.SettingsSnap"), PCWSTR::null(), std::ptr::null(), 0, 0x1000_0000, std::ptr::null());
+            assert!(desk != 0 && SetThreadDesktop(desk) != 0);
+            open(HWND::default());
+            let hwnd = OPEN.with(|c| c.get());
+            let st = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Settings);
+            let (w, h) = (st.s(CLIENT_W), st.s(1500));
+            for page in [Page::General, Page::Appearance, Page::Hotkeys] {
+                st.page = page;
+                st.scroll = 0;
+                let dc = CreateCompatibleDC(None);
+                let info = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32, ..Default::default() },
+                    ..Default::default()
+                };
+                let mut bits = std::ptr::null_mut();
+                let bmp = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+                let old = SelectObject(dc, bmp.into());
+                SetBkMode(dc, TRANSPARENT);
+                st.render(dc, w, h);
+                let _ = GdiFlush();
+                let used = st.content_h.clamp(st.s(CLIENT_H), h);
+                let px = std::slice::from_raw_parts(bits as *const u32, (w * used) as usize);
+                crate::ui::draw::write_png(&format!("{dir}/settings-{page:?}.png"), px, w as usize, used as usize, 1);
+                SelectObject(dc, old);
+                let _ = DeleteObject(bmp.into());
+                let _ = DeleteDC(dc);
+            }
+            let _ = DestroyWindow(hwnd);
+        })
+        .join()
+        .unwrap();
+        let _ = std::fs::remove_dir_all(tmp);
     }
 }

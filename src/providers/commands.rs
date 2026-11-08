@@ -11,7 +11,7 @@ pub struct Def {
     cmd: Command,
 }
 
-/// A static list of commands forming one extension.
+/// A static list of commands forming one module.
 pub struct CommandsProvider {
     id: &'static str,
     section: &'static str,
@@ -26,6 +26,7 @@ pub const SIGMA5: CommandsProvider = CommandsProvider {
         Def { title: "Reload Applications", subtitle: "", keywords: "refresh reindex rescan apps", glyph: '\u{E72C}', cmd: Command::ReloadApps },
         Def { title: "SIGMA5 Settings", subtitle: "", keywords: "config preferences options hotkey theme", glyph: '\u{E713}', cmd: Command::OpenSettings },
         Def { title: "Check for Updates", subtitle: "", keywords: "update upgrade new version", glyph: '\u{E895}', cmd: Command::CheckUpdates },
+        Def { title: "Suggest a Feature", subtitle: "", keywords: "recommend idea request feedback suggestion wish improve", glyph: '\u{E82F}', cmd: Command::SuggestFeature },
         Def { title: "Open SIGMA5 Data Folder", subtitle: "", keywords: "appdata files history", glyph: '\u{E8B7}', cmd: Command::OpenDataFolder },
         Def { title: "Quit SIGMA5", subtitle: "", keywords: "exit close stop", glyph: '\u{E7E8}', cmd: Command::Quit },
     ],
@@ -52,6 +53,33 @@ pub const CLIPBOARD: CommandsProvider = CommandsProvider {
         Def { title: "Clear Clipboard History", subtitle: "Clipboard", keywords: "delete wipe forget", glyph: '\u{E74D}', cmd: Command::ClearClipboard },
     ],
 };
+
+pub const FILES: CommandsProvider = CommandsProvider {
+    id: "files",
+    section: "Files",
+    defs: &[
+        Def { title: "Search Files", subtitle: "Files", keywords: "find file folder document recent explorer open", glyph: '\u{E8B7}', cmd: Command::SearchFiles },
+    ],
+};
+
+pub const COLORS: CommandsProvider = CommandsProvider {
+    id: "colors",
+    section: "Colours",
+    defs: &[
+        Def { title: "Pick Colour", subtitle: "Colours", keywords: "color picker eyedropper dropper hex rgb screen sample", glyph: '\u{EF3C}', cmd: Command::PickColor },
+        Def { title: "Colour History", subtitle: "Colours", keywords: "color picked palette saved hex", glyph: '\u{E790}', cmd: Command::ColorHistory },
+        Def { title: "Clear Colour History", subtitle: "Colours", keywords: "color delete wipe forget", glyph: '\u{E74D}', cmd: Command::ClearColors },
+    ],
+};
+
+/// Every command list, for finding a command by its key (used by hotkeys).
+const ALL: [&CommandsProvider; 5] = [&SIGMA5, &WINGET, &CLIPBOARD, &FILES, &COLORS];
+
+/// A command from its history/hotkey key ("cmd:PickColor"): its module id,
+/// title, glyph and the command itself.
+pub fn find(k: &str) -> Option<(&'static str, &'static str, char, Command)> {
+    ALL.iter().find_map(|p| p.defs.iter().find(|d| key(d.cmd) == k).map(|d| (p.id, d.title, d.glyph, d.cmd)))
+}
 
 fn key(cmd: Command) -> String {
     format!("cmd:{cmd:?}")
@@ -97,5 +125,19 @@ impl Provider for CommandsProvider {
 
     fn lookup(&self, k: &str) -> Option<Item> {
         self.defs.iter().find(|d| key(d.cmd) == k).map(|d| item(d, 0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commands_found_by_key() {
+        let (module, title, _, cmd) = find("cmd:PickColor").unwrap();
+        assert_eq!((module, title, cmd), ("colors", "Pick Colour", Command::PickColor));
+        assert_eq!(find("cmd:SearchFiles").unwrap().3, Command::SearchFiles);
+        assert!(find("cmd:Nope").is_none());
+        assert!(find("Microsoft.WindowsCalculator").is_none());
     }
 }

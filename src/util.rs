@@ -95,6 +95,54 @@ pub fn now_unix() -> u64 {
 }
 
 /// Puts Unicode text on the clipboard. Returns false if the clipboard was busy.
+/// Percent-encodes text for a URL query value.
+pub fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Where feature suggestions go: a WhatsApp chat with SIGMA5's developer.
+pub const SUGGEST_PHONE: &str = "27721793369";
+
+/// The prefilled WhatsApp message for a feature suggestion.
+pub fn suggestion_text(idea: &str, version: &str) -> String {
+    let idea: String = idea.trim().chars().take(1500).collect();
+    format!("SIGMA5 feature idea: {idea}\n\n(SIGMA5 {version})")
+}
+
+/// Text currently on the clipboard, if any.
+pub fn clipboard_text(owner: windows::Win32::Foundation::HWND) -> Option<String> {
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe {
+        IsClipboardFormatAvailable(CF_UNICODETEXT).ok()?;
+        OpenClipboard(Some(owner)).ok()?;
+        let text = (|| {
+            let h = HGLOBAL(GetClipboardData(CF_UNICODETEXT).ok()?.0);
+            let p = GlobalLock(h) as *const u16;
+            if p.is_null() {
+                return None;
+            }
+            let max = (GlobalSize(h) / 2).min(4096);
+            let units = std::slice::from_raw_parts(p, max);
+            let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+            let s = String::from_utf16_lossy(&units[..end]);
+            let _ = GlobalUnlock(h);
+            Some(s)
+        })();
+        let _ = CloseClipboard();
+        text
+    }
+}
+
 pub fn copy_to_clipboard(owner: windows::Win32::Foundation::HWND, text: &str) -> bool {
     use windows::Win32::Foundation::{GlobalFree, HANDLE};
     use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
@@ -139,5 +187,18 @@ impl SendHwnd {
     }
     pub fn get(self) -> windows::Win32::Foundation::HWND {
         windows::Win32::Foundation::HWND(self.0 as *mut _)
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    #[test]
+    fn suggestion_message_is_encoded() {
+        assert_eq!(url_encode("a b&c/ä"), "a%20b%26c%2F%C3%A4");
+        let t = suggestion_text("  Spotify in the top bar  ", "0.3.0");
+        assert_eq!(t, "SIGMA5 feature idea: Spotify in the top bar\n\n(SIGMA5 0.3.0)");
+        assert!(!url_encode(&t).contains(' '));
     }
 }

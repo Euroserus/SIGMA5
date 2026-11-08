@@ -14,10 +14,14 @@ Built by a Mechanical Engineering student, for engineering students. Raycast-sty
 - **Software maintenance without the hassle.** Search, install, upgrade and remove packages through WinGet.
 - **Clipboard history** for the numbers, part numbers and code snippets you keep re-copying, with private content from password managers skipped.
 - **Key remaps** (numpad → media keys, etc.) and an optional Start-menu replacement on the Windows key.
+- **File search** across your user folder (Desktop, Documents, OneDrive…) with typo-tolerant fuzzy matching (`brkt mount` finds `bracket_mount.SLDPRT`), plus your recent files.
+- **Colour picker** with a magnifying loupe, colour history, and `#hex` / `rgb()` / `hsl()` conversion as you type.
+- **Top bar** with a clock and live CPU, RAM, GPU, temperatures, battery, network and disk readings: pick and order them yourself.
+- **Make it yours:** square or rounded corners, fonts, text size, window and row size, and every colour.
 
 ### Releases
 
-Each release is named after a famous engineer or researcher. The current release is **0.2 “Euler”**, after Leonhard Euler, whose mechanics, beam theory and mathematics underpin much of engineering.
+Each release is named after a famous engineer or researcher. The current release is **0.3 “Charpy”**, after Georges Charpy, whose impact test is still how engineers measure a material's toughness. Before it came 0.2 “Euler”, after Leonhard Euler.
 
 SIGMA5 updates itself: installed copies check GitHub every 12 hours and offer new versions in the launcher. One Enter downloads it, verifies its SHA-256 checksum and swaps it in, keeping your settings.
 
@@ -47,9 +51,31 @@ The exe isn't code-signed, so Windows SmartScreen may say "Windows protected you
 | `Ctrl+,` | Open Settings |
 | `Win` (optional) | Tap the Windows key to open SIGMA5 instead of Start (Settings › General) |
 
+Have an idea? Run *Suggest a Feature*, type it, and press Enter: WhatsApp opens a chat with SIGMA5's developer with your idea (and SIGMA5 version) typed in, ready to send. Without the WhatsApp app it opens WhatsApp Web instead.
+
 An empty search shows **Recent** items, then every application, then SIGMA5's own commands (Reload Applications, Settings, Data Folder, Quit). There is also a tray icon with the same options.
 
 You can move the launcher: drag it by the search bar (anywhere past the text) or the footer. It opens centred again next time.
+
+### File search
+
+Type a few letters of a file or folder name and the best matches appear under your results; *Search Files* opens a page with up to 60 matches, and shows your recent files when the search is empty.
+
+- **Enter** opens it, **Shift+Enter** shows it in Explorer.
+- Matching is fuzzy but strict about each word: `brkt mount`, `eng draw` and `lab rep` all work, while letters scattered through a long name don't count. Recently changed files rank higher.
+- It indexes your user folder (skipping hidden and system items, AppData, `node_modules` and dot-folders) in the background and keeps it in memory: about 40 bytes per file, so 35,000 files is ~1.5 MB, and a search takes about a millisecond. Add more folders with `file_folders` in config.toml.
+
+### Colour picker
+
+*Pick Colour* shows a magnifying loupe that follows your cursor. Click to pick, arrow keys nudge by a pixel (Shift: ten), Esc cancels. The colour is copied as HEX and added to *Colour History*, where Enter copies HEX and Shift+Enter copies RGB. Typing `#ff8800`, `rgb(255, 136, 0)` or `hsl(32, 100%, 50%)` in the launcher shows the colour in all three formats.
+
+### Top bar
+
+A strip above the search box with a clock, the date and live readings: CPU, RAM and GPU use (with meters), CPU and GPU temperature, battery, network speed and free disk space. Choose and order them under Settings › Top Bar. Readings are taken once a second only while the launcher is open (about 2 ms each), so it costs nothing in the background. GPU temperature needs an NVIDIA driver; CPU temperature needs a PC that exposes an ACPI thermal zone, which many laptops don't. Unavailable readings show "—".
+
+### Appearance
+
+Settings › Appearance covers theme and accent (presets or any colour), square or rounded corners (square by default), animations, the interface and search fonts, text size, launcher width, height and row height, and every colour: background, text, secondary text, selection and borders. Set a colour by picking it from the screen or pasting a hex code; a custom background re-derives the other surfaces so contrast holds. A coloured border runs round the launcher (2 px in the accent by default; set its thickness, 0–8 px, and colour). Small animations (the calculator's copy pulse on any copied row, a flash on launch, sliding toggles) can be turned off, and follow Windows' own animation setting.
 
 ### Fidget mode
 
@@ -91,7 +117,7 @@ Open Settings with `Ctrl+,` in the launcher, the **SIGMA5 Settings** command, or
 | Appearance | Theme (System / Dark / Light), accent colour (Windows accent + 7 presets), launcher size (Compact / Default / Large) |
 | Hotkeys | Bind any app to any shortcut: launch it, bring it to the front, or minimise it if it's already in front |
 | Keyboard | Caps Lock → Default / Hyper (Ctrl+Shift+Alt) / Ctrl / Esc / Off, plus a list of key remaps |
-| Extensions | Turn each provider on or off |
+| Modules | Turn each module on or off |
 | About | Open config file / data folder, clear launch history, reset all settings |
 
 The Settings window is created only when opened and destroyed when closed, so it uses no memory the rest of the time. If a shortcut belongs to another app (e.g. 1Password's `Ctrl+Shift+Space`), that app grabs the keys and Settings tells you to pick another.
@@ -104,7 +130,7 @@ Type maths and the answer appears in a card at the top of the results:
 - **Units with dimensional analysis:** `3 kN * 0.5 m` → `1,500 J`, `5 kg * 9.81 m/s^2` → `49.05 N`, `10 m / 2 s` → `5 m/s`, `5 ft 10 in to cm`, `200 psi to MPa`, `100 C to F`, `100 rpm to rad/s`, `1 GiB to MB`, `m2`/`ft3` shorthands. Convert with `to`, `in`, `as` or `->`. A bare quantity (`5 km`) shows its metric/imperial counterpart.
 - **Covers:** length, area, volume, mass, time, temperature (absolute for single readings), speed, acceleration, force, pressure/stress, energy/torque, power, angle/rotation (1 rev = 2π rad is handled, so rpm ↔ rad/s and rpm ↔ Hz both work), frequency, electrical, and data.
 - **Enter** copies the plain number to the clipboard *and* leaves the answer (with its unit) in the search box, so you can keep going (`* 2`, ` to lbf ft`). The card pulses to confirm.
-- It stays out of the way of app searches: `7zip`, `1password`, `office 365` and lone words or numbers never trigger it. It can be turned off under Settings › Extensions.
+- It stays out of the way of app searches: `7zip`, `1password`, `office 365` and lone words or numbers never trigger it. It can be turned off under Settings › Modules.
 
 ### WinGet
 
@@ -128,12 +154,12 @@ Installs, upgrades and removals open a console window so you can follow progress
 - **Enter** pastes into the window you were in, **Shift+Enter** just copies, **Shift+Delete** removes an entry.
 - Content that apps mark as private (password managers such as 1Password do) is never recorded.
 - Text and file history is saved encrypted with Windows DPAPI, so only your Windows account can read it. Images are kept in memory only (the last 20). The last 250 entries are kept.
-- Turn it off under Settings › Extensions; *Clear Clipboard History* wipes it.
+- Turn it off under Settings › Modules; *Clear Clipboard History* wipes it.
 
 ### App hotkeys, Hyper key and remaps (replaces AutoHotkey + Raycast hotkeys + PowerToys Keyboard Manager)
 
 - **Hyper key:** set Caps Lock to *Hyper* and it acts as Ctrl+Shift+Alt while held. Tapped alone it does nothing (the release is masked so no Alt menu pops up). Caps Lock is switched off automatically when you enable a remap of it.
-- **App hotkeys:** Settings › Hotkeys › *Add app hotkey* turns the launcher into an app picker; choose the app, then press the shortcut (e.g. Caps+C). Like Raycast: pressing it launches the app if it isn't running, brings it to the front if it is, and minimises it if it's already in front. Pressing again restores exactly the windows it minimised. Windows are matched by AppUserModelID, package identity (Store/MSIX apps like Claude, Outlook, Spotify) or exe.
+- **App and command hotkeys:** Settings › Hotkeys › *Add app or command hotkey* turns the launcher into a picker; choose an app or a SIGMA5 command (Pick Colour, Search Files, Clipboard History, …), then press the shortcut (e.g. Caps+C). Commands run straight away; ones that open a page show the launcher on it. If another app already owns the shortcut (PowerToys, for example), SIGMA5's keyboard hook takes it over, so it still works. Like Raycast: pressing it launches the app if it isn't running, brings it to the front if it is, and minimises it if it's already in front. Pressing again restores exactly the windows it minimised. Windows are matched by AppUserModelID, package identity (Store/MSIX apps like Claude, Outlook, Spotify) or exe.
 - **Remaps:** Settings › Keyboard › *Add remap*: press the key to change, then pick what it sends: another key or shortcut (record it), a media key (Play/Pause, Next, Previous, Stop, Volume up/down, Mute), Hyper, or Disabled. Numpad keys are recognised with Num Lock on or off, and Numpad Enter is separate from Enter.
 - **Recording** uses the keyboard hook, so it sees keys before other apps' global shortcuts. A combo that's taken is reported instead of silently failing.
 - **Cost:** a single `WH_KEYBOARD_LL` hook on its own thread, running only while a remap, the Windows-key option or recording is active. Each key costs microseconds; nothing is polled.
@@ -173,7 +199,7 @@ start_with_windows = false      # Run entry + Task Manager "startup approved" re
 auto_update = true              # check GitHub for new versions every 12 hours
 keep_query_secs = 30            # reopen within N seconds to keep your last search
 recent_count = 6
-disabled_extensions = []        # e.g. ["commands"]
+disabled_modules = []           # e.g. ["commands", "files"]
 ```
 
 Other files in that folder: `history.tsv` (launch counts for ranking) and `apps.cache` (app list, so results are ready instantly at startup).
@@ -196,6 +222,9 @@ src/
   winget.rs          WinGet queries (table parser) and console actions
   clipboard.rs       clipboard history: capture, privacy filters, DPAPI-encrypted store
   keys.rs            key names/codes, numpad handling, remap targets
+  files.rs           file index (compact, fuzzy two-pass search) and Windows' recent files
+  colors.rs          colour parsing, formats and picked-colour history
+  sysinfo.rs         top bar readings (CPU, RAM, GPU, temps, battery, network, disk)
   providers/         ── result sources ("plugins")
     mod.rs           Provider trait, Item, Action, Registry
     apps.rs          shell:AppsFolder indexer + icon extraction (background thread)
@@ -206,6 +235,7 @@ src/
     settings.rs      Settings window (custom-drawn controls, hotkey recorder)
     draw.rs          shared GDI primitives, anti-aliased shapes, fonts
     fidget.rs        fidget mode: shake detection, particle physics, click-through overlay
+    picker.rs        screen colour picker (click-catching layer + loupe)
     theme.rs         colours, accents, layout metrics
     icons.rs         icon bitmap cache
     hotkey.rs        hotkey parsing/registration
@@ -218,7 +248,7 @@ src/
 Plugins are compiled in, not loaded at runtime. To add one, for example web search:
 
 1. Create `src/providers/web.rs` with a struct implementing `Provider` (`id`, `section`, `search`, `browse`, `lookup`).
-2. Add an `ExtensionInfo` entry to `EXTENSIONS` (`src/providers/mod.rs`) so it gets an on/off toggle in Settings.
+2. Add a `ModuleInfo` entry to `MODULES` (`src/providers/mod.rs`) so it gets an on/off toggle in Settings › Modules.
 3. If it needs new behaviour on Enter, add a variant to `Action` (e.g. `OpenUrl(String)`) and handle it in `Launcher::activate` (`src/ui/window.rs`).
 4. Register it in `Registry` (`src/providers/mod.rs`).
 
@@ -227,13 +257,15 @@ The UI renders any `Item` (title, subtitle, accessory label, app icon or Fluent 
 ## Roadmap
 
 - [x] App launcher (Win32 + Store apps), fuzzy search, frecency, tray, hotkey, themes
-- [x] Settings window (hotkey recorder, theme/accent/size, extensions, reset)
+- [x] Settings window (hotkey recorder, theme/accent/size, modules, reset)
 - [x] Optional Start menu replacement (tap the Windows key)
 - [x] App hotkeys (focus or launch), Hyper Caps Lock, key remaps incl. media keys
 - [x] WinGet: search, install, upgrade, uninstall, export/import
 - [x] Clipboard history with preview, paste-back and privacy filtering
 - [x] Self-updating from GitHub Releases (0.2 “Euler”)
 - [x] Draggable launcher and fidget mode (shake it to dissolve the letters into orbiting pixels)
+- [x] File search, colour picker, top bar, appearance customisation, modules (0.3 “Charpy”)
+- [ ] Spotify controls in the top bar
 - [ ] Google search fallback ("Search Google for …")
 - [ ] Ask AI (inline answer view)
 - [ ] Actions panel (`Ctrl+K`): run as admin, open file location, copy path

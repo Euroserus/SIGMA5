@@ -10,6 +10,9 @@
 //!    media key, modifier set like Hyper, or nothing) is injected instead.
 //! 3. **Windows-key tap**: a lone Win tap opens SIGMA5 instead of Start (see
 //!    [`TapDetector`]).
+//! 4. **Taken-over hotkeys**: SIGMA5 hotkeys that another app has already
+//!    registered (so `RegisterHotKey` refuses them) are recognised here, before
+//!    Windows dispatches hotkeys, swallowed, and delivered as `WM_HOTKEY`.
 //!
 //! The hook thread only exists while one of these is needed. Our own injected
 //! events are ignored by the hook, so remaps never loop.
@@ -40,6 +43,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::{WM_APP_CAPTURE_MODS, WM_APP_CAPTURED, WM_APP_WINKEY};
+use windows::Win32::UI::WindowsAndMessaging::WM_HOTKEY;
 use crate::keys::{self, ALT, CTRL, SHIFT, Target, WIN};
 
 /// Unassigned virtual key used to "mask" a lone Win/Alt release (as AutoHotkey does).
@@ -56,6 +60,8 @@ const MSG_RELEASE_ALL: u32 = WM_USER + 1;
 pub struct Rules {
     pub win_tap: bool,
     pub remaps: Vec<(u32, Target)>,
+    /// Hotkeys to take over: (modifier bits, key code, WM_HOTKEY id).
+    pub hotkeys: Vec<(u8, u32, i32)>,
 }
 
 impl Rules {
@@ -63,8 +69,13 @@ impl Rules {
         self.remaps.iter().find(|(c, _)| *c == code).map(|(_, t)| *t)
     }
     fn is_empty(&self) -> bool {
-        !self.win_tap && self.remaps.is_empty()
+        !self.win_tap && self.remaps.is_empty() && self.hotkeys.is_empty()
     }
+}
+
+/// The hotkey (by id) that `code` pressed with exactly `held` modifiers triggers.
+pub fn match_hotkey(hotkeys: &[(u8, u32, i32)], code: u32, held: u8) -> Option<i32> {
+    hotkeys.iter().find(|(m, k, _)| *k == keys::vk(code) as u32 && *m == held).map(|(_, _, id)| *id)
 }
 
 static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
@@ -139,6 +150,9 @@ pub fn shutdown() {
 }
 
 fn update_thread() {
+    if super::headless() {
+        return;
+    }
     let needed = CAPTURE.load(Ordering::Acquire) != 0 || !current_rules().is_empty();
     let running = HOOK_THREAD.load(Ordering::Acquire);
     if needed && running == 0 {
@@ -362,6 +376,8 @@ struct HookState {
     remap: Remapper,
     capture: Capture,
     capture_owner: isize,
+    /// Key of a taken-over hotkey that is down (its repeats and release are swallowed too).
+    hot_key: Option<u32>,
 }
 
 impl HookState {
@@ -377,6 +393,24 @@ thread_local! {
 
 fn key_held(vk: u32) -> bool {
     unsafe { GetAsyncKeyState(vk as i32) < 0 }
+}
+
+/// Modifiers held right now (including ones our remaps inject, like Hyper).
+fn held_mods() -> u8 {
+    let mut m = 0;
+    if key_held(0x11) {
+        m |= CTRL;
+    }
+    if key_held(0x10) {
+        m |= SHIFT;
+    }
+    if key_held(0x12) {
+        m |= ALT;
+    }
+    if key_held(0x5B) || key_held(0x5C) {
+        m |= WIN;
+    }
+    m
 }
 
 /// True if the focused window's process is elevated (or we can't tell).
@@ -501,9 +535,31 @@ fn handle(k: &KBDLLHOOKSTRUCT, is_down: bool) -> bool {
         if is_down {
             s.remap.note_other_key(code);
         }
+
+        // 4. Taken-over hotkeys.
+        if s.hot_key == Some(code) {
+            if !is_down {
+                s.hot_key = None;
+            }
+            return true;
+        }
+        if is_down && !rules.hotkeys.is_empty() {
+            let held = held_mods();
+            if let Some(id) = match_hotkey(&rules.hotkeys, code, held) {
+                s.hot_key = Some(code);
+                drop(s);
+                // With Win or Alt held, a key the shell sees between their
+                // press and release stops Start or a menu bar from opening.
+                if held & (WIN | ALT) != 0 {
+                    send(&[key_input(MASK_VK, false, false), key_input(MASK_VK, true, false)]);
+                }
+                post(TARGET.load(Ordering::Relaxed), WM_HOTKEY, id as usize, 0);
+                return true;
+            }
+        }
         drop(s);
 
-        // 4. Windows key → SIGMA5.
+        // 5. Windows key → SIGMA5.
         if verdict == Verdict::Tap && rules.win_tap && !foreground_is_elevated() {
             let inputs = [
                 key_input(MASK_VK, false, false),
@@ -618,6 +674,16 @@ mod tests {
         r.note_other_key(0x41);
         assert_eq!(r.release_all(), vec![(keys::VK_LCONTROL, true)]);
         assert!(r.release_all().is_empty());
+    }
+
+    #[test]
+    fn taken_over_hotkeys_need_exact_modifiers() {
+        let hk = [(WIN | SHIFT, 0x43, 100), (CTRL | ALT | SHIFT, 0x50, 101)];
+        assert_eq!(match_hotkey(&hk, 0x43, WIN | SHIFT), Some(100));
+        assert_eq!(match_hotkey(&hk, 0x43, WIN), None);
+        assert_eq!(match_hotkey(&hk, 0x43, WIN | SHIFT | CTRL), None);
+        assert_eq!(match_hotkey(&hk, 0x50, CTRL | ALT | SHIFT), Some(101));
+        assert_eq!(match_hotkey(&hk, 0x44, WIN | SHIFT), None);
     }
 
     #[test]
