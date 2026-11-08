@@ -49,6 +49,14 @@ The exe isn't code-signed, so Windows SmartScreen may say "Windows protected you
 
 An empty search shows **Recent** items, then every application, then SIGMA5's own commands (Reload Applications, Settings, Data Folder, Quit). There is also a tray icon with the same options.
 
+You can move the launcher: drag it by the search bar (anywhere past the text) or the footer. It opens centred again next time.
+
+### Fidget mode
+
+Pick the launcher up and shake it hard. The letters in the search box dissolve into pixels that swirl round your mouse like planets round a sun, clumping together as they orbit. Anything you type then dissolves straight away. **Enter** (or another shake) scatters them, and **Esc** ends it.
+
+It costs nothing until you start it. While it runs, the physics is O(n) (particles attract through a coarse grid, not pairwise) and only the parts of the screen that changed are redrawn, at about 1 ms per frame in normal use. Pixels are sized by DPI, so they look the same on any screen.
+
 ## Build & run
 
 Requires Rust (MSVC toolchain) and the Visual Studio C++ Build Tools.
@@ -197,6 +205,7 @@ src/
     paint.rs         launcher rendering
     settings.rs      Settings window (custom-drawn controls, hotkey recorder)
     draw.rs          shared GDI primitives, anti-aliased shapes, fonts
+    fidget.rs        fidget mode: shake detection, particle physics, click-through overlay
     theme.rs         colours, accents, layout metrics
     icons.rs         icon bitmap cache
     hotkey.rs        hotkey parsing/registration
@@ -224,6 +233,7 @@ The UI renders any `Item` (title, subtitle, accessory label, app icon or Fluent 
 - [x] WinGet: search, install, upgrade, uninstall, export/import
 - [x] Clipboard history with preview, paste-back and privacy filtering
 - [x] Self-updating from GitHub Releases (0.2 “Euler”)
+- [x] Draggable launcher and fidget mode (shake it to dissolve the letters into orbiting pixels)
 - [ ] Google search fallback ("Search Google for …")
 - [ ] Ask AI (inline answer view)
 - [ ] Actions panel (`Ctrl+K`): run as admin, open file location, copy path

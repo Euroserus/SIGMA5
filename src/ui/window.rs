@@ -14,17 +14,17 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, GetDC, GetMonitorInfoW, GetTextMetricsW, HBRUSH, HDC, HFONT,
+    ClientToScreen, CreateSolidBrush, DeleteObject, GetDC, HGDIOBJ, MonitorFromWindow, GetMonitorInfoW, GetTextMetricsW, HBRUSH, HDC, HFONT,
     InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, ReleaseDC, SelectObject,
     SetBkColor, SetTextColor, TEXTMETRICW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
-    EM_GETSEL, EM_REPLACESEL, EM_SETCUEBANNER, EM_SETLIMITTEXT, EM_SETMARGINS, EM_SETSEL,
+    EM_GETRECT, EM_GETSEL, EM_POSFROMCHAR, EM_REPLACESEL, EM_SETCUEBANNER, EM_SETLIMITTEXT, EM_SETMARGINS, EM_SETSEL,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_NEXT, VK_PRIOR,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_NEXT, VK_PRIOR,
     VK_DELETE, VK_RETURN, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
@@ -37,9 +37,10 @@ use super::paint::{self, Fonts};
 use super::settings;
 use super::input;
 use super::{
-    WM_APP_APP_PICKED, WM_APP_CHECK_UPDATE, WM_APP_CLEAR_HISTORY, WM_APP_CONFIG_CHANGED, WM_APP_PICK_APP, WM_APP_UPDATE,
-    WM_APP_WINGET, WM_APP_WINKEY,
+    WM_APP_APP_PICKED, WM_APP_CHECK_UPDATE, WM_APP_CLEAR_HISTORY, WM_APP_CONFIG_CHANGED, WM_APP_DRAG_BEGIN,
+    WM_APP_DRAG_END, WM_APP_FIDGET_CHAR, WM_APP_FIDGET_FRAME, WM_APP_PICK_APP, WM_APP_UPDATE, WM_APP_WINGET, WM_APP_WINKEY,
 };
+use super::fidget::{Fidget, Pacer, Shake};
 use super::theme::{self, Theme, metrics as m};
 use super::{hotkey, tray};
 use super::{
@@ -58,8 +59,23 @@ const REINDEX_AFTER: Duration = Duration::from_secs(5 * 60);
 const PULSE_TIMER: usize = 7;
 const STATUS_TIMER: usize = 8;
 const EDIT_ID: usize = 100;
+/// Typed letters start again from the left after this long without typing.
+const FIDGET_CARET_RESET: Duration = Duration::from_millis(1500);
+const FIDGET_STATUS: &str = "Fidget mode: type to make pixels · Enter to scatter · Esc to stop";
+
+/// The launcher being dragged by the mouse.
+struct Drag {
+    /// Cursor position minus window position when the drag started.
+    grab: (i32, i32),
+    started: Instant,
+    shake: Shake,
+}
 
 thread_local! {
+    /// Fidget mode is running: the search box hands typed characters to the
+    /// launcher instead of inserting them.
+    static FIDGET_ON: Cell<bool> = const { Cell::new(false) };
+
     /// Search box colours, read during WM_CTLCOLOREDIT without touching state.
     static EDIT_STYLE: Cell<(HBRUSH, COLORREF, COLORREF)> =
         const { Cell::new((HBRUSH(std::ptr::null_mut()), COLORREF(0), COLORREF(0))) };
@@ -122,6 +138,13 @@ pub struct Launcher {
     update: Option<crate::update::UpdateInfo>,
     /// An update check or download is in flight.
     update_busy: bool,
+    drag: Option<Drag>,
+    /// Fidget mode (pixels orbiting the cursor), while it runs.
+    fidget: Option<Box<Fidget>>,
+    /// Paces fidget frames to the monitor's refresh rate.
+    pacer: Option<Pacer>,
+    /// Where the next typed letter appears (search box x) and when the last one was typed.
+    fidget_caret: (i32, Option<Instant>),
 }
 
 /// Posted by update worker threads.
@@ -412,6 +435,10 @@ impl Launcher {
             prev_foreground: HWND::default(),
             update: None,
             update_busy: false,
+            drag: None,
+            fidget: None,
+            pacer: None,
+            fidget_caret: (0, None),
         });
         me.create_edit();
         me.apply_dpi(dpi, false);
@@ -837,6 +864,15 @@ impl Launcher {
         let mut buf = vec![0u16; len as usize + 1];
         let n = unsafe { GetWindowTextW(self.edit, &mut buf) };
         let text = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+        if self.fidget.is_some() && !text.is_empty() {
+            // Pasted (or otherwise inserted) text dissolves too.
+            let (at, font) = (self.edit_char_pos(0), self.fonts.search);
+            if let Some(f) = &mut self.fidget {
+                f.dissolve(&text, font, at, 0, (0.0, 0.0));
+            }
+            self.set_search_text("");
+            return;
+        }
         if text != self.query {
             if self.calc_hold.as_ref().is_some_and(|h| h.chain != text.trim()) {
                 self.calc_hold = None;
@@ -1231,6 +1267,8 @@ impl Launcher {
         self.visible = false;
         self.hidden_at = Some(Instant::now());
         self.press_row = None;
+        self.drag = None;
+        self.stop_fidget();
         if self.pick_for.take().is_some() {
             // Pick cancelled (or finished): back to normal mode next time.
             self.status = None;
@@ -1276,6 +1314,13 @@ impl Launcher {
             let lr = self.list_rect();
             ((lr.bottom - lr.top) / self.s(m::ROW_H)).max(1)
         };
+        if self.fidget.is_some() {
+            match vk {
+                VK_ESCAPE if !ctrl => return self.stop_fidget(),
+                VK_RETURN => return self.fidget_burst(),
+                _ => {}
+            }
+        }
         match vk {
             VK_DOWN => self.move_selection(1, true),
             VK_UP => self.move_selection(-1, true),
@@ -1476,6 +1521,172 @@ impl Launcher {
         }
     }
 
+    // ----- dragging & fidget mode ------------------------------------------
+
+    fn unit(&self) -> f32 {
+        self.eff_dpi() as f32 / 96.0
+    }
+
+    /// Parts of the launcher that pick it up: the search bar (outside the
+    /// text and back arrow) and the footer.
+    fn is_drag_handle(&self, x: i32, y: i32) -> bool {
+        let (_, h) = self.client_size();
+        let on_back = self.back_rect().is_some_and(|r| super::draw::contains(&r, x, y));
+        (y < self.s(m::SEARCH_H) && !on_back) || y >= h - self.s(m::FOOTER_H)
+    }
+
+    fn begin_drag(&mut self) {
+        let mut pt = POINT::default();
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+            let _ = GetWindowRect(self.hwnd, &mut rc);
+            SetCapture(self.hwnd);
+        }
+        self.drag = Some(Drag { grab: (pt.x - rc.left, pt.y - rc.top), started: Instant::now(), shake: Shake::new(self.unit()) });
+    }
+
+    fn on_drag_move(&mut self) {
+        let Some(d) = &mut self.drag else { return };
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+            let _ = SetWindowPos(
+                self.hwnd,
+                None,
+                pt.x - d.grab.0,
+                pt.y - d.grab.1,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        if d.shake.sample(d.started.elapsed().as_secs_f32(), pt.x as f32, pt.y as f32) {
+            let (vx, vy) = d.shake.velocity();
+            let u = self.unit();
+            if self.fidget.is_some() {
+                self.fidget_burst();
+            } else {
+                // The letters fly off with some of the shake's momentum.
+                self.start_fidget((vx / u * 0.5, vy / u * 0.5));
+            }
+        }
+    }
+
+    /// Dissolves what the search box shows (the typed text, or else the
+    /// placeholder) into pixels and starts the simulation.
+    fn start_fidget(&mut self, vel: (f32, f32)) {
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let mon = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) };
+        unsafe {
+            let _ = GetMonitorInfoW(mon, &mut mi);
+        }
+        let t = self.theme;
+        let Some(mut f) = Fidget::start(self.hwnd, mi.rcMonitor, self.unit(), [t.text, t.subtext], t.accent) else {
+            return;
+        };
+        if self.query.is_empty() {
+            f.dissolve(self.mode.placeholder(), self.fonts.search, self.edit_text_origin(), 1, vel);
+        } else {
+            f.dissolve(&self.query, self.fonts.search, self.edit_char_pos(0), 0, vel);
+            self.set_search_text("");
+            self.refresh_rows(false);
+        }
+        self.fidget = Some(f);
+        FIDGET_ON.with(|c| c.set(true));
+        self.fidget_caret = (0, None);
+        self.set_placeholder("");
+        self.set_status(FIDGET_STATUS, false, None);
+        self.pacer = Some(Pacer::start(self.hwnd, WM_APP_FIDGET_FRAME, mon));
+    }
+
+    fn stop_fidget(&mut self) {
+        if self.fidget.take().is_none() {
+            return;
+        }
+        FIDGET_ON.with(|c| c.set(false));
+        self.pacer = None;
+        self.set_placeholder(self.mode.placeholder());
+        if matches!(&self.status, Some((s, _, _)) if s == FIDGET_STATUS) {
+            self.status = None;
+        }
+        self.invalidate();
+    }
+
+    fn fidget_burst(&mut self) {
+        let Some(f) = &mut self.fidget else { return };
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+        }
+        let (x, y) = f.to_sim(pt.x, pt.y);
+        f.sim.burst(x, y);
+    }
+
+    fn on_fidget_frame(&mut self) {
+        let Some(f) = &mut self.fidget else { return };
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+        }
+        f.tick(pt);
+        if let Some(p) = &self.pacer {
+            p.frame_done();
+        }
+    }
+
+    /// A letter typed in fidget mode: it appears where the next letter would
+    /// go and dissolves at once.
+    fn on_fidget_char(&mut self, code: u16) {
+        // Lone surrogate halves (emoji) are skipped.
+        let Some(c) = char::from_u32(code as u32) else { return };
+        let (origin, box_w) = (self.edit_text_origin(), self.edit_text_rect().right - self.edit_text_rect().left);
+        let font = self.fonts.search;
+        let now = Instant::now();
+        let (mut x, last) = self.fidget_caret;
+        if last.is_none_or(|t| now - t > FIDGET_CARET_RESET) {
+            x = 0;
+        }
+        let Some(f) = &mut self.fidget else { return };
+        x += f.dissolve(&c.to_string(), font, POINT { x: origin.x + x, y: origin.y }, 0, (0.0, -60.0));
+        if x > box_w - self.s(24) {
+            x = 0;
+        }
+        self.fidget_caret = (x, Some(now));
+    }
+
+    /// The search box's formatting rectangle (where text is drawn), in its client coordinates.
+    fn edit_text_rect(&self) -> RECT {
+        let mut rc = RECT::default();
+        unsafe {
+            SendMessageW(self.edit, EM_GETRECT, None, Some(LPARAM(&mut rc as *mut RECT as isize)));
+        }
+        rc
+    }
+
+    /// Screen position where the search box starts drawing text.
+    fn edit_text_origin(&self) -> POINT {
+        let rc = self.edit_text_rect();
+        let mut pt = POINT { x: rc.left, y: rc.top };
+        unsafe {
+            let _ = ClientToScreen(self.edit, &mut pt);
+        }
+        pt
+    }
+
+    /// Screen position of character `i` in the search box.
+    fn edit_char_pos(&self, i: usize) -> POINT {
+        let r = unsafe { SendMessageW(self.edit, EM_POSFROMCHAR, Some(WPARAM(i)), None) }.0;
+        if r == -1 {
+            return self.edit_text_origin();
+        }
+        let mut pt = POINT { x: (r & 0xFFFF) as i16 as i32, y: ((r >> 16) & 0xFFFF) as i16 as i32 };
+        unsafe {
+            let _ = ClientToScreen(self.edit, &mut pt);
+        }
+        pt
+    }
+
     fn on_mouse_move(&mut self, x: i32, y: i32) {
         if (x, y) == self.last_mouse {
             return;
@@ -1515,6 +1726,18 @@ impl Launcher {
         let dpi = unsafe { GetDpiForWindow(self.hwnd) };
         if dpi != 0 && dpi != self.dpi {
             self.apply_dpi(dpi, true);
+            // Dragged onto a monitor with a different scale: resize to match.
+            unsafe {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    None,
+                    0,
+                    0,
+                    self.s(m::WIDTH),
+                    self.s(m::HEIGHT),
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
         }
         let t = theme::resolve(self.config.config.theme, self.config.config.accent);
         if t != self.theme {
@@ -1667,6 +1890,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return LRESULT(0);
         }
         WM_ERASEBKGND => return LRESULT(1),
+        // Sent re-entrantly by ReleaseCapture.
+        WM_CAPTURECHANGED => {
+            post(hwnd, WM_APP_DRAG_END);
+            return LRESULT(0);
+        }
         WM_CLOSE => {
             post(hwnd, WM_APP_HIDE);
             return LRESULT(0);
@@ -1788,13 +2016,40 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             LRESULT(0)
         }
+        WM_APP_DRAG_BEGIN => {
+            ui.begin_drag();
+            LRESULT(0)
+        }
+        WM_APP_DRAG_END => {
+            ui.drag = None;
+            LRESULT(0)
+        }
+        WM_APP_FIDGET_CHAR => {
+            ui.on_fidget_char(wp.0 as u16);
+            LRESULT(0)
+        }
+        WM_APP_FIDGET_FRAME => {
+            ui.on_fidget_frame();
+            LRESULT(0)
+        }
         WM_MOUSEMOVE => {
+            if ui.drag.is_some() {
+                ui.on_drag_move();
+                return LRESULT(0);
+            }
             let (x, y) = point_from_lparam(lp);
             ui.on_mouse_move(x, y);
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
             let (x, y) = point_from_lparam(lp);
+            if ui.is_drag_handle(x, y) {
+                unsafe {
+                    let _ = SetFocus(Some(ui.edit));
+                }
+                ui.begin_drag();
+                return LRESULT(0);
+            }
             ui.press_row = ui.hit_test(x, y);
             if let Some(i) = ui.press_row {
                 ui.selected = Some(i);
@@ -1806,6 +2061,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_LBUTTONUP => {
+            if ui.drag.take().is_some() {
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                return LRESULT(0);
+            }
             let (x, y) = point_from_lparam(lp);
             if ui.back_rect().is_some_and(|r| super::draw::contains(&r, x, y)) {
                 ui.go_back();
@@ -1906,7 +2167,24 @@ unsafe extern "system" fn edit_proc(
             if matches!(c, 0x0D | 0x1B | 0x09 | 0x7F | 0x01 | 0x0E | 0x10 | 0x0A | 0x0B) {
                 return LRESULT(0);
             }
+            // Fidget mode: letters dissolve instead of being typed.
+            if c >= 0x20 && FIDGET_ON.with(|f| f.get()) {
+                unsafe {
+                    let parent = GetParent(hwnd).unwrap_or_default();
+                    let _ = PostMessageW(Some(parent), WM_APP_FIDGET_CHAR, wp, LPARAM(0));
+                }
+                return LRESULT(0);
+            }
         }
+        // Pressing past the end of the text picks the launcher up.
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK if unsafe { past_text_end(hwnd, (lp.0 & 0xFFFF) as i16 as i32) } => unsafe {
+            let _ = SetFocus(Some(hwnd));
+            let len = GetWindowTextLengthW(hwnd).max(0) as usize;
+            SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(len)), Some(LPARAM(len as isize)));
+            let parent = GetParent(hwnd).unwrap_or_default();
+            SendMessageW(parent, WM_APP_DRAG_BEGIN, None, None);
+            return LRESULT(0);
+        },
         WM_SETFOCUS => {
             let r = unsafe { DefSubclassProc(hwnd, msg, wp, lp) };
             // A slightly thicker caret than the 1px default.
@@ -1926,6 +2204,33 @@ unsafe extern "system" fn edit_proc(
         _ => {}
     }
     unsafe { DefSubclassProc(hwnd, msg, wp, lp) }
+}
+
+/// Whether client x `x` in the search box is clearly past the end of its text.
+unsafe fn past_text_end(edit: HWND, x: i32) -> bool {
+    unsafe {
+        let len = GetWindowTextLengthW(edit);
+        if len <= 0 {
+            return true;
+        }
+        let r = SendMessageW(edit, EM_POSFROMCHAR, Some(WPARAM(len as usize - 1)), None).0;
+        if r == -1 {
+            return false;
+        }
+        let last_x = (r & 0xFFFF) as i16 as i32;
+        let mut buf = vec![0u16; len as usize + 1];
+        let n = GetWindowTextW(edit, &mut buf) as usize;
+        let Some(&last) = buf[..n].last() else { return true };
+        let font = SendMessageW(edit, WM_GETFONT, None, None).0;
+        let hdc = GetDC(Some(edit));
+        let old = SelectObject(hdc, HGDIOBJ(font as *mut _));
+        let mut sz = windows::Win32::Foundation::SIZE::default();
+        let _ = windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(hdc, &[last], &mut sz);
+        SelectObject(hdc, old);
+        ReleaseDC(Some(edit), hdc);
+        let slack = 8 * GetDpiForWindow(edit).max(96) as i32 / 96;
+        x > last_x + sz.cx + slack
+    }
 }
 
 unsafe fn delete_word_back(edit: HWND) {

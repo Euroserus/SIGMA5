@@ -2,6 +2,7 @@
 //! global hotkey, so opening it is instant.
 
 pub mod draw;
+pub mod fidget;
 pub mod hotkey;
 pub mod icons;
 pub mod input;
@@ -58,3 +59,11 @@ pub const WM_APP_WINGET: u32 = WM_APP + 19;
 pub const WM_APP_UPDATE: u32 = WM_APP + 20;
 /// Settings asks the launcher to check for updates now.
 pub const WM_APP_CHECK_UPDATE: u32 = WM_APP + 21;
+/// The search box was pressed past its text: start dragging the launcher.
+pub const WM_APP_DRAG_BEGIN: u32 = WM_APP + 22;
+/// Mouse capture was lost: stop dragging.
+pub const WM_APP_DRAG_END: u32 = WM_APP + 23;
+/// A character typed while fidget mode runs: WPARAM = UTF-16 code unit.
+pub const WM_APP_FIDGET_CHAR: u32 = WM_APP + 24;
+/// Fidget mode: the monitor refreshed, draw a frame (posted by the vsync thread).
+pub const WM_APP_FIDGET_FRAME: u32 = WM_APP + 25;
