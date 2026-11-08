@@ -121,6 +121,16 @@ pub fn stop_capture() {
     update_thread();
 }
 
+/// Presses Ctrl+V (used to paste a clipboard history entry).
+pub fn send_paste() {
+    send(&[
+        key_input(keys::VK_LCONTROL as u16, false, false),
+        key_input(b'V' as u16, false, false),
+        key_input(b'V' as u16, true, false),
+        key_input(keys::VK_LCONTROL as u16, true, false),
+    ]);
+}
+
 /// Stops the hook (on exit).
 pub fn shutdown() {
     CAPTURE.store(0, Ordering::Release);

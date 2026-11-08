@@ -34,7 +34,7 @@ use super::draw::{
 use super::theme::{self, Theme, WHITE, accent_color};
 use super::{
     WM_APP_APP_PICKED, WM_APP_CAPTURE_MODS, WM_APP_CAPTURED, WM_APP_CLEAR_HISTORY, WM_APP_CONFIG_CHANGED,
-    WM_APP_PICK_APP, WM_APP_SETTINGS_MENU, hotkey, icons, input, tray,
+    WM_APP_CHECK_UPDATE, WM_APP_PICK_APP, WM_APP_SETTINGS_MENU, hotkey, icons, input, tray,
 };
 use crate::config::{Accent, AppHotkey, CapsMode, Config, ConfigStore, Remap, ThemeMode, UiSize};
 use crate::keys::{self, Target};
@@ -124,6 +124,7 @@ enum Stepper {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Btn {
+    CheckUpdates,
     OpenConfig,
     OpenData,
     ClearHistory,
@@ -134,6 +135,7 @@ enum Btn {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Rec {
     Launcher,
+    ClipHotkey,
     App(usize),
     DraftApp,
     From(usize),
@@ -160,6 +162,8 @@ enum MenuFor {
 enum Ctl {
     Nav(Page),
     Rec(Rec),
+    ClearClipHotkey,
+    AutoUpdate,
     WindowsKey,
     StartWithWindows,
     Step(Stepper, i32),
@@ -349,6 +353,9 @@ impl Settings {
         if except != Rec::Launcher && same(&self.cfg().hotkey) {
             return Some("the launcher".into());
         }
+        if except != Rec::ClipHotkey && same(&self.cfg().clipboard_hotkey) {
+            return Some("Clipboard History".into());
+        }
         self.cfg()
             .app_hotkeys
             .iter()
@@ -365,7 +372,7 @@ impl Settings {
             return;
         }
         match r {
-            Rec::Launcher | Rec::App(_) | Rec::DraftApp => {
+            Rec::Launcher | Rec::ClipHotkey | Rec::App(_) | Rec::DraftApp => {
                 let spec = match hotkey::format(mods, code) {
                     Ok(s) => s,
                     Err(e) => {
@@ -381,6 +388,7 @@ impl Settings {
                 }
                 let current = match r {
                     Rec::Launcher => self.cfg().hotkey.clone(),
+                    Rec::ClipHotkey => self.cfg().clipboard_hotkey.clone(),
                     Rec::App(i) => self.cfg().app_hotkeys.get(i).map(|b| b.hotkey.clone()).unwrap_or_default(),
                     _ => String::new(),
                 };
@@ -395,6 +403,7 @@ impl Settings {
                 let c = &mut self.store.config;
                 match r {
                     Rec::Launcher => c.hotkey = spec,
+                    Rec::ClipHotkey => c.clipboard_hotkey = spec,
                     Rec::App(i) => {
                         if let Some(b) = c.app_hotkeys.get_mut(i) {
                             b.hotkey = spec;
@@ -516,6 +525,20 @@ impl Settings {
                 } else {
                     self.start_recording(r);
                 }
+            }
+            Ctl::ClearClipHotkey => {
+                self.store.config.clipboard_hotkey.clear();
+                self.commit();
+            }
+            Ctl::AutoUpdate => {
+                self.store.config.auto_update ^= true;
+                self.commit();
+            }
+            Ctl::Button(Btn::CheckUpdates) => {
+                unsafe {
+                    let _ = PostMessageW(Some(self.launcher), WM_APP_CHECK_UPDATE, WPARAM(0), LPARAM(0));
+                }
+                self.set_notice(Btn::CheckUpdates, "Checking… the result appears as a notification");
             }
             Ctl::WindowsKey => {
                 self.store.config.windows_key ^= true;
@@ -790,7 +813,7 @@ impl Settings {
             y += self.s(42);
         }
 
-        let v = format!("Version {}", env!("CARGO_PKG_VERSION"));
+        let v = format!("Version {}", crate::install::version_label());
         let vr = RECT { left: self.s(24), top: h - self.s(40), right: sw, bottom: h - self.s(16) };
         text(dc, &v, &vr, self.fonts.small, t.subtext, DT_LEFT);
     }
@@ -1060,17 +1083,35 @@ impl Settings {
         };
         self.labels(dc, &rc, ix, b.left - self.s(16), "Launcher hotkey", &desc, col);
 
+        // Clipboard history hotkey (optional)
         let rc = self.card(dc, x0, x1, self.row_y(y, 1), rh);
+        let cy = (rc.top + rc.bottom) / 2;
+        let rec = self.recording == Some(Rec::ClipHotkey);
+        let spec = self.cfg().clipboard_hotkey.clone();
+        let mut box_right = right;
+        if !spec.is_empty() && !rec {
+            box_right = self.icon_button(dc, right, cy, '\u{E711}', Ctl::ClearClipHotkey) - self.s(8);
+        }
+        let labels = if rec { self.live_keys() } else { hotkey::parts(&spec) };
+        let b = self.keys_box(dc, box_right, true, cy, &labels, if rec { "Press keys…" } else { "Not set" }, rec, Ctl::Rec(Rec::ClipHotkey), self.s(150));
+        let (desc, col) = match (self.error_for(|r| r == Rec::ClipHotkey), rec) {
+            (Some(e), _) => (e, t.warn),
+            (None, true) => ("Press the new shortcut, or Esc to cancel".to_string(), t.accent),
+            (None, false) => ("Opens Clipboard History directly, e.g. Ctrl+Shift+V".to_string(), t.subtext),
+        };
+        self.labels(dc, &rc, ix, b.left - self.s(16), "Clipboard history hotkey", &desc, col);
+
+        let rc = self.card(dc, x0, x1, self.row_y(y, 2), rh);
         let on = self.cfg().windows_key;
         let left = self.toggle(dc, right, (rc.top + rc.bottom) / 2, on, Ctl::WindowsKey);
         self.labels(dc, &rc, ix, left - self.s(16), "Open with Windows key", "Replaces the Start menu. Ctrl+Esc still opens Start", t.subtext);
 
-        let rc = self.card(dc, x0, x1, self.row_y(y, 2), rh);
+        let rc = self.card(dc, x0, x1, self.row_y(y, 3), rh);
         let on = self.cfg().start_with_windows;
         let left = self.toggle(dc, right, (rc.top + rc.bottom) / 2, on, Ctl::StartWithWindows);
         self.labels(dc, &rc, ix, left - self.s(16), "Launch at login", "Start SIGMA5 in the background when you sign in", t.subtext);
 
-        let rc = self.card(dc, x0, x1, self.row_y(y, 3), rh);
+        let rc = self.card(dc, x0, x1, self.row_y(y, 4), rh);
         let k = self.cfg().keep_query_secs;
         let left = self.stepper(
             dc, right, (rc.top + rc.bottom) / 2, &keep_label(k), Stepper::KeepQuery,
@@ -1078,13 +1119,13 @@ impl Settings {
         );
         self.labels(dc, &rc, ix, left - self.s(16), "Keep last search", "Reopen within this time to pick up where you left off", t.subtext);
 
-        let rc = self.card(dc, x0, x1, self.row_y(y, 4), rh);
+        let rc = self.card(dc, x0, x1, self.row_y(y, 5), rh);
         let r = self.cfg().recent_count;
         let label = if r == 0 { "Off".to_string() } else { r.to_string() };
         let left = self.stepper(dc, right, (rc.top + rc.bottom) / 2, &label, Stepper::Recent, r == 0, r >= RECENT_MAX);
         self.labels(dc, &rc, ix, left - self.s(16), "Recent items", "Recently used items shown when the search box is empty", t.subtext);
 
-        let tip_y = self.row_y(y, 5) + self.s(6);
+        let tip_y = self.row_y(y, 6) + self.s(6);
         self.note(dc, x0, x1, tip_y, "Tip: press Ctrl+, in the launcher to open settings. Ctrl+Tab switches pages here.", t.subtext)
     }
 
@@ -1275,10 +1316,24 @@ impl Settings {
         let tx = ix + self.s(74);
         let mid = (rc.top + rc.bottom) / 2;
         text(dc, "SIGMA5", &RECT { left: tx, top: mid - self.s(26), right: x1, bottom: mid }, self.fonts.title, t.text, DT_LEFT);
-        let sub = format!("Version {} · A fast, lightweight launcher for Windows", env!("CARGO_PKG_VERSION"));
+        let sub = format!("Version {} · A fast launcher for engineers", crate::install::version_label());
         text(dc, &sub, &RECT { left: tx, top: mid + self.s(2), right: x1 - self.s(16), bottom: mid + self.s(22) }, self.fonts.small, t.subtext, DT_LEFT | DT_END_ELLIPSIS);
 
-        let y = y + hh + self.s(ROW_GAP);
+        let mut y = y + hh + self.s(ROW_GAP);
+
+        // Updates: auto-check toggle + Check now.
+        let rc = self.card(dc, x0, x1, y, rh);
+        let cy = (rc.top + rc.bottom) / 2;
+        let on = self.cfg().auto_update;
+        let tl = self.toggle(dc, right, cy, on, Ctl::AutoUpdate);
+        let bl = self.button(dc, tl - self.s(14), cy, "Check now", Btn::CheckUpdates, false);
+        let (d, c) = match &self.notice {
+            Some((b, msg, until)) if *b == Btn::CheckUpdates && Instant::now() < *until => (msg.clone(), t.accent),
+            _ => ("Get new versions from GitHub automatically".to_string(), t.subtext),
+        };
+        self.labels(dc, &rc, ix, bl - self.s(16), "Updates", &d, c);
+        y = rc.bottom + self.s(ROW_GAP);
+
         let path = self.store.path().display().to_string();
         let rows: [(&str, String, &str, Btn, bool); 4] = [
             ("Configuration file", path, "Open", Btn::OpenConfig, false),

@@ -86,7 +86,7 @@ fn item(a: &AppEntry, score: i32) -> Item {
         key: key(&a.id),
         title: a.name.clone(),
         subtitle: String::new(),
-        accessory: "Application",
+        accessory: "Application".into(),
         icon: Icon::App(a.id.clone()),
         action: Action::LaunchApp { id: a.id.clone() },
         score,
@@ -104,6 +104,11 @@ impl AppsProvider {
 
     pub fn find(&self, id: &str) -> Option<&AppEntry> {
         self.apps.iter().find(|a| a.id == id)
+    }
+
+    /// Start-menu name of the app with this exe ("code.exe" → "Visual Studio Code").
+    pub fn name_for_exe(&self, exe: &str) -> Option<&str> {
+        self.apps.iter().find(|a| a.exe.as_deref() == Some(exe)).map(|a| a.name.as_str())
     }
 
     pub fn set_entries(&mut self, apps: Vec<AppEntry>) {

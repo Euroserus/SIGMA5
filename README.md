@@ -2,18 +2,34 @@
 
 # SIGMA5 (S5)
 
-A fast, lightweight launcher for Windows, built in Rust on raw Win32.
+**A fast launcher for engineers on Windows.** Open CAD, simulation and coding tools in a keystroke, do unit-aware maths without reaching for a calculator, and keep your machine's software up to date, all from one small window.
 
-- **Instant:** the window is created once and shown/hidden on the hotkey (opens in ~10 ms).
-- **Tiny:** < 1 MB executable, ~13 MB private memory, no web view, no GPU framework, no runtime.
-- **Finds everything the Start menu does:** classic desktop apps *and* Microsoft Store apps, with their real icons.
-- **Smart ranking:** fuzzy matching ("vsc" → Visual Studio Code, "sw" → SOLIDWORKS) plus frecency, so the apps you use most float to the top.
+Built by a Mechanical Engineering student for engineering students. Raycast-style, but written in Rust on raw Win32: no web view, no runtime, a ~1 MB exe, ~13 MB of RAM, and it opens in ~10 ms.
+
+### Why engineers use it
+
+- **Unit-aware calculator.** Type the maths, get the answer *with dimensions*: `3 kN * 0.5 m` → `1,500 J`, `200 psi to MPa`, `9.81 m/s^2 * 75 kg` → `735.75 N`, `100 rpm to rad/s`, `5 ft 10 in to cm`, `100 C to F`. It knows ~110 units across force, pressure/stress, energy/torque, power, temperature, rotation and more, and refuses physically meaningless maths (metres + seconds). Enter copies the answer and keeps it ready for the next step of the calculation.
+- **Your tools, instantly.** Fuzzy search finds SOLIDWORKS (`sw`), Inventor, Fusion, MATLAB, ANSYS, Excel or VS Code from a couple of letters, ranking the ones you use most first.
+- **One-key app switching.** Turn Caps Lock into a *Hyper* key and bind Caps+letter to any app: it launches it, brings it to the front, or hides it if it's already in front. It's great for flipping between CAD, a spreadsheet and your notes.
+- **Software maintenance without the hassle.** Search, install, upgrade and remove packages through WinGet.
+- **Clipboard history** for the numbers, part numbers and code snippets you keep re-copying, with private content from password managers skipped.
+- **Key remaps** (numpad → media keys, etc.) and an optional Start-menu replacement on the Windows key.
+
+### Releases
+
+Each release is named after a famous engineer or researcher. The current release is **0.2 “Euler”**, after Leonhard Euler, whose mechanics, beam theory and mathematics underpin much of engineering.
+
+SIGMA5 updates itself: installed copies check GitHub every 12 hours and offer new versions in the launcher. One Enter downloads it, verifies its SHA-256 checksum and swaps it in, keeping your settings.
 
 ## Install
 
-1. Download `sigma5.exe` from the [latest release](../../releases/latest). It's a single file; nothing else to install.
-2. Put it somewhere permanent, e.g. `%LOCALAPPDATA%\SIGMA5\sigma5.exe`, and run it.
-3. Press `Alt+Space`. Open Settings with `Ctrl+,` to turn on *Launch at login*, change the hotkey, and so on.
+1. Download `sigma5.exe` from the [latest release](../../releases/latest) and run it.
+2. Click **Install**. SIGMA5 copies itself to `%LOCALAPPDATA%\Programs\SIGMA5` (no admin rights needed), adds a Start menu shortcut, sets up launch at login, and appears in **Settings › Apps** so you can uninstall it normally. Or click **Just run it** to use it without installing.
+3. Press `Alt+Space`. Open Settings with `Ctrl+,`.
+
+**Updating:** automatic. When a new version is out, an *Update Available* banner appears at the top of the launcher; press Enter (Shift+Enter shows the release notes). You can also run **Check for Updates**, or use Settings › About. Turn off background checks there if you prefer.
+**Uninstalling:** Settings › Apps › SIGMA5 › Uninstall (your settings in `%APPDATA%\SIGMA5` are kept).
+**Command line:** `sigma5.exe --install` installs quietly, `--uninstall` removes it, `--portable` skips the installer.
 
 The exe isn't code-signed, so Windows SmartScreen may say "Windows protected your PC" the first time. Click **More info → Run anyway**. Requires Windows 10 or 11 (64-bit).
 
@@ -45,6 +61,14 @@ cargo build --release
 ./target/release/sigma5.exe
 ```
 
+**Publishing a release:** bump `version` in `Cargo.toml` and `CODENAME` in `src/install.rs`, write release notes to a Markdown file, commit, then:
+
+```bash
+powershell -ExecutionPolicy Bypass -File scripts/release.ps1 -Notes notes.md
+```
+
+It runs the tests, builds, and publishes `SIGMA5 <version> “<Codename>”` with `sigma5.exe` attached. GitHub records the file's SHA-256, which the updater checks before installing.
+
 The logo source is `SIGMA5_LOGO.svg`. `assets/make-icon.ps1` turns it into the embedded `sigma5.ico` (exe, tray, windows) and `sigma5.png`. Rerun the script if the logo changes.
 
 Running the exe again while SIGMA5 is already running just opens the existing window. `--background` starts it hidden (this is what the start-at-login entry uses).
@@ -73,6 +97,30 @@ Type maths and the answer appears in a card at the top of the results:
 - **Covers:** length, area, volume, mass, time, temperature (absolute for single readings), speed, acceleration, force, pressure/stress, energy/torque, power, angle/rotation (1 rev = 2π rad is handled, so rpm ↔ rad/s and rpm ↔ Hz both work), frequency, electrical, and data.
 - **Enter** copies the plain number to the clipboard *and* leaves the answer (with its unit) in the search box, so you can keep going (`* 2`, ` to lbf ft`). The card pulses to confirm.
 - It stays out of the way of app searches: `7zip`, `1password`, `office 365` and lone words or numbers never trigger it. It can be turned off under Settings › Extensions.
+
+### WinGet
+
+Type `winget` (or a command name) in the launcher:
+
+| Command | What it does |
+| --- | --- |
+| **Search Packages** | Live search of the WinGet catalogue; Enter installs |
+| **Show Installed** | Your installed packages (filter as you type); Enter upgrades if an update exists, otherwise uninstalls; Shift+Enter uninstalls |
+| **Show Upgradable** | Packages with updates, plus *Upgrade All*; Enter upgrades |
+| **Upgrade All Packages** | `winget upgrade --all` |
+| **Export Packages** | Saves `winget-packages-<date>.json` to Documents |
+| **Import Packages** | Pick an export file and install everything in it |
+
+Installs, upgrades and removals open a console window so you can follow progress and answer any UAC prompt. Uninstalling asks for confirmation first. Esc (or Backspace on an empty box) goes back.
+
+### Clipboard history
+
+**Clipboard History** (or a hotkey you set in Settings › General, e.g. `Ctrl+Shift+V`) opens a page with everything you've copied: text, files and images, grouped by Today / Yesterday / Earlier, with a preview pane and details (source app, time, size).
+
+- **Enter** pastes into the window you were in, **Shift+Enter** just copies, **Shift+Delete** removes an entry.
+- Content that apps mark as private (password managers such as 1Password do) is never recorded.
+- Text and file history is saved encrypted with Windows DPAPI, so only your Windows account can read it. Images are kept in memory only (the last 20). The last 250 entries are kept.
+- Turn it off under Settings › Extensions; *Clear Clipboard History* wipes it.
 
 ### App hotkeys, Hyper key and remaps (replaces AutoHotkey + Raycast hotkeys + PowerToys Keyboard Manager)
 
@@ -113,7 +161,8 @@ theme = "system"                # "system" | "dark" | "light"
 accent = "violet"               # system, violet, blue, teal, green, orange, red, pink
 size = "default"                # "compact" | "default" | "large"
 windows_key = false             # tap Win to open SIGMA5 instead of Start
-start_with_windows = false      # adds/removes HKCU\...\Run\SIGMA5
+start_with_windows = false      # Run entry + Task Manager "startup approved" record
+auto_update = true              # check GitHub for new versions every 12 hours
 keep_query_secs = 30            # reopen within N seconds to keep your last search
 recent_count = 6
 disabled_extensions = []        # e.g. ["commands"]
@@ -131,9 +180,13 @@ src/
   fuzzy.rs           query matcher + scoring (unit-tested)
   history.rs         frecency store
   config.rs          TOML settings with hot reload
-  launch.rs          shell launching, start-at-login
+  launch.rs          shell launching, start-at-login (Run entry + startup approval)
+  install.rs         self-install / uninstall, version + codename
+  update.rs          GitHub Releases check, verified download (WinHTTP + BCrypt SHA-256)
   focus.rs           focus-or-launch for app hotkeys (window matching)
   calc/              calculator: parser, dimensional evaluator, unit table, formatting
+  winget.rs          WinGet queries (table parser) and console actions
+  clipboard.rs       clipboard history: capture, privacy filters, DPAPI-encrypted store
   keys.rs            key names/codes, numpad handling, remap targets
   providers/         ── result sources ("plugins")
     mod.rs           Provider trait, Item, Action, Registry
@@ -168,6 +221,9 @@ The UI renders any `Item` (title, subtitle, accessory label, app icon or Fluent 
 - [x] Settings window (hotkey recorder, theme/accent/size, extensions, reset)
 - [x] Optional Start menu replacement (tap the Windows key)
 - [x] App hotkeys (focus or launch), Hyper Caps Lock, key remaps incl. media keys
+- [x] WinGet: search, install, upgrade, uninstall, export/import
+- [x] Clipboard history with preview, paste-back and privacy filtering
+- [x] Self-updating from GitHub Releases (0.2 “Euler”)
 - [ ] Google search fallback ("Search Google for …")
 - [ ] Ask AI (inline answer view)
 - [ ] Actions panel (`Ctrl+K`): run as admin, open file location, copy path

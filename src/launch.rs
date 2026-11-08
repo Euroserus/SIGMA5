@@ -1,7 +1,9 @@
 //! Launching things through the Windows shell, plus start-at-login.
 
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize};
-use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW};
+use windows::Win32::System::Registry::{
+    HKEY_CURRENT_USER, REG_BINARY, REG_SZ, RRF_RT_REG_BINARY, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
+};
 use windows::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{PCWSTR, w};
@@ -50,6 +52,17 @@ pub fn open_file(path: &std::path::Path) {
     });
 }
 
+/// Opens an https:// link in the default browser.
+pub fn open_url(url: &str) {
+    if !url.starts_with("https://") {
+        return;
+    }
+    let u = url.to_string();
+    spawn_shell(move || {
+        shell_execute(&u, None);
+    });
+}
+
 pub fn open_folder(path: &std::path::Path) {
     let p = path.to_string_lossy().to_string();
     spawn_shell(move || {
@@ -59,12 +72,18 @@ pub fn open_folder(path: &std::path::Path) {
 
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const RUN_VALUE: PCWSTR = w!("SIGMA5");
+/// Task Manager's "Startup apps" state. Recent Windows builds only launch
+/// per-user Run entries that have a record here (02… = enabled, 03… = disabled).
+const APPROVED_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run");
 
-/// Adds or removes SIGMA5's own value under HKCU\...\Run.
+/// Adds or removes SIGMA5's own startup entry (HKCU\...\Run plus its
+/// "startup approved" record).
 pub fn set_start_with_windows(enabled: bool) {
     unsafe {
         if enabled {
-            let Ok(exe) = std::env::current_exe() else { return };
+            // Prefer the installed copy, so a dev/portable build never
+            // hijacks autostart.
+            let exe = crate::install::autostart_exe();
             let cmd = wide(&format!("\"{}\" --background", exe.display()));
             let _ = RegSetKeyValueW(
                 HKEY_CURRENT_USER,
@@ -74,8 +93,24 @@ pub fn set_start_with_windows(enabled: bool) {
                 Some(cmd.as_ptr() as *const _),
                 (cmd.len() * 2) as u32,
             );
+            // Add an "enabled" record only if none exists, so switching
+            // SIGMA5 off in Task Manager is respected.
+            let mut size = 0u32;
+            let exists = RegGetValueW(HKEY_CURRENT_USER, APPROVED_KEY, RUN_VALUE, RRF_RT_REG_BINARY, None, None, Some(&mut size)).is_ok();
+            if !exists {
+                let enabled_record = [2u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                let _ = RegSetKeyValueW(
+                    HKEY_CURRENT_USER,
+                    APPROVED_KEY,
+                    RUN_VALUE,
+                    REG_BINARY.0,
+                    Some(enabled_record.as_ptr() as *const _),
+                    enabled_record.len() as u32,
+                );
+            }
         } else {
             let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
+            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, APPROVED_KEY, RUN_VALUE);
         }
     }
 }

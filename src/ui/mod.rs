@@ -5,6 +5,7 @@ pub mod draw;
 pub mod hotkey;
 pub mod icons;
 pub mod input;
+pub mod installer;
 pub mod paint;
 pub mod settings;
 pub mod theme;
@@ -51,3 +52,9 @@ pub const WM_APP_PICK_APP: u32 = WM_APP + 16;
 pub const WM_APP_APP_PICKED: u32 = WM_APP + 17;
 /// Settings: show a deferred popup menu (avoids holding state during the menu loop).
 pub const WM_APP_SETTINGS_MENU: u32 = WM_APP + 18;
+/// WinGet query finished: LPARAM = Box<WingetResult>.
+pub const WM_APP_WINGET: u32 = WM_APP + 19;
+/// Update check / download progress: LPARAM = Box<UpdateEvent>.
+pub const WM_APP_UPDATE: u32 = WM_APP + 20;
+/// Settings asks the launcher to check for updates now.
+pub const WM_APP_CHECK_UPDATE: u32 = WM_APP + 21;

@@ -10,6 +10,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use crate::keys;
 
 pub const HOTKEY_ID: i32 = 1;
+/// Opens the launcher straight on Clipboard History.
+pub const CLIPBOARD_HOTKEY_ID: i32 = 2;
 pub const APP_HOTKEY_BASE: i32 = 100;
 const PROBE_ID: i32 = 999;
 

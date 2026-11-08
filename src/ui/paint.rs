@@ -24,6 +24,8 @@ pub struct Fonts {
     pub calc_big: HFONT,
     pub calc_expr: HFONT,
     pub calc_glyph: HFONT,
+    /// Clipboard text preview.
+    pub mono: HFONT,
 }
 
 impl Fonts {
@@ -41,13 +43,14 @@ impl Fonts {
             calc_big: draw::font(s(30), 600, DISPLAY_FACES),
             calc_expr: draw::font(s(19), 400, DISPLAY_FACES),
             calc_glyph: draw::font(s(12), 400, ICON_FACES),
+            mono: draw::font(s(13), 400, &["Cascadia Mono", "Consolas"]),
         }
     }
 
     pub fn destroy(&mut self) {
         draw::delete_fonts(&[
             self.search, self.title, self.small, self.header, self.glyph, self.kbd_glyph, self.letter,
-            self.calc_big, self.calc_expr, self.calc_glyph,
+            self.calc_big, self.calc_expr, self.calc_glyph, self.mono,
         ]);
     }
 }
@@ -77,8 +80,145 @@ fn draw(ui: &Launcher, dc: HDC, w: i32, h: i32) {
     fill(dc, &RECT { left: 0, top: search_h, right: w, bottom: search_h + 1 }, t.divider);
     fill(dc, &RECT { left: 0, top: h - footer_h - 1, right: w, bottom: h - footer_h }, t.divider);
 
+    // Sub-pages: back arrow (left) and page title chip (right) in the search bar.
+    if let Some(back) = ui.back_rect() {
+        text(dc, "\u{E72B}", &back, ui.fonts.glyph, t.subtext, DT_CENTER);
+        let title = ui.mode.title();
+        let tw = text_width(dc, title, ui.fonts.header);
+        let ch = ui.s(24);
+        let cy = search_h / 2;
+        let chip = RECT { left: w - ui.s(18) - tw - ui.s(20), top: cy - ch / 2, right: w - ui.s(18), bottom: cy - ch / 2 + ch };
+        round_rect(dc, &chip, ui.s(6), t.kbd_bg);
+        text(dc, title, &chip, ui.fonts.header, t.kbd_text, DT_CENTER);
+    }
+
     draw_list(ui, dc);
+    if ui.mode == super::window::Mode::Clipboard {
+        draw_clip_preview(ui, dc);
+    }
     draw_footer(ui, dc, w, h);
+}
+
+fn ago_long(then: u64) -> String {
+    let s = crate::util::now_unix().saturating_sub(then);
+    let n = |v: u64, unit: &str| format!("{v} {unit}{} ago", if v == 1 { "" } else { "s" });
+    match s {
+        0..60 => "Just now".into(),
+        60..3600 => n(s / 60, "minute"),
+        3600..86_400 => n(s / 3600, "hour"),
+        _ => n(s / 86_400, "day"),
+    }
+}
+
+fn draw_clip_preview(ui: &Launcher, dc: HDC) {
+    let dpi = ((ui.s(960) as f32) / 10.0).round() as u32; // effective DPI incl. launcher size
+    let e = ui.selected_clip();
+    let source = e.map(|e| ui.source_name(&e.source)).unwrap_or_default();
+    draw_clip_preview_into(dc, ui.preview_rect(), e, &source, &ui.theme, &ui.fonts, dpi);
+}
+
+/// Right-hand pane on the Clipboard page: the selected entry in full, then an
+/// Information table. Window-independent so it can be rendered in tests.
+pub fn draw_clip_preview_into(
+    dc: HDC, pr: RECT, e: Option<&crate::clipboard::Entry>, source: &str, t: &Theme, fonts: &Fonts, dpi: u32,
+) {
+    use crate::clipboard::Content;
+    let s = |v: i32| (v * dpi as i32 + 48) / 96;
+    fill(dc, &RECT { left: pr.left - 1, right: pr.left, ..pr }, t.divider);
+    let Some(e) = e else {
+        text(dc, "Nothing selected", &pr, fonts.title, t.subtext, DT_CENTER);
+        return;
+    };
+
+    let mut info: Vec<(&str, String)> =
+        vec![("Source", source.to_string()), ("Content type", e.content.kind().into()), ("Copied", ago_long(e.copied))];
+    match &e.content {
+        Content::Text(txt) => {
+            info.push(("Characters", txt.chars().count().to_string()));
+            info.push(("Words", txt.split_whitespace().count().to_string()));
+        }
+        Content::Files(f) => info.push(("Files", f.len().to_string())),
+        Content::Image { width, height, .. } => info.push(("Dimensions", format!("{width} × {height}"))),
+    }
+    let row_h = s(26);
+    let info_top = pr.bottom - s(12) - row_h * info.len() as i32 - s(28);
+    let pad = s(16);
+    let content = RECT { left: pr.left + pad, top: pr.top + s(14), right: pr.right - pad, bottom: info_top - s(10) };
+
+    unsafe {
+        SaveDC(dc);
+        IntersectClipRect(dc, content.left, content.top, content.right, content.bottom);
+    }
+    match &e.content {
+        Content::Text(txt) => {
+            let shown: String = txt.chars().take(4000).collect();
+            draw_wrapped(dc, &shown, &content, fonts.mono, t.text);
+        }
+        Content::Files(f) => draw_wrapped(dc, &f.join("\n"), &content, fonts.mono, t.text),
+        Content::Image { width, height, dib, .. } => draw_dib(dc, &content, *width, *height, dib, t),
+    }
+    unsafe {
+        let _ = RestoreDC(dc, -1);
+    }
+
+    fill(dc, &RECT { left: pr.left + pad, top: info_top, right: pr.right - pad, bottom: info_top + 1 }, t.divider);
+    let hr = RECT { left: pr.left + pad, top: info_top + s(4), right: pr.right - pad, bottom: info_top + s(28) };
+    text(dc, "Information", &hr, fonts.header, t.header, DT_LEFT);
+    for (i, (label, value)) in info.iter().enumerate() {
+        let top = info_top + s(28) + i as i32 * row_h;
+        let r = RECT { left: pr.left + pad, top, right: pr.right - pad, bottom: top + row_h };
+        text(dc, label, &r, fonts.small, t.subtext, DT_LEFT);
+        text(dc, value, &r, fonts.small, t.text, DT_RIGHT | DT_END_ELLIPSIS);
+        if i + 1 < info.len() {
+            fill(dc, &RECT { left: r.left, top: r.bottom - 1, right: r.right, bottom: r.bottom }, mix(t.divider, t.bg, 0.4));
+        }
+    }
+}
+
+/// Multi-line, word-wrapped text.
+fn draw_wrapped(dc: HDC, s: &str, rc: &RECT, font: HFONT, color: windows::Win32::Foundation::COLORREF) {
+    let mut buf: Vec<u16> = s.replace("\r\n", "\n").encode_utf16().collect();
+    let mut r = *rc;
+    unsafe {
+        let old = SelectObject(dc, font.into());
+        SetTextColor(dc, color);
+        DrawTextW(dc, &mut buf, &mut r, DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX | DT_EXPANDTABS);
+        SelectObject(dc, old);
+    }
+}
+
+/// Draws a packed DIB scaled to fit `area`, preserving aspect ratio.
+fn draw_dib(dc: HDC, area: &RECT, w: i32, h: i32, dib: &[u8], t: &Theme) {
+    if w <= 0 || h <= 0 || dib.len() < 40 {
+        return;
+    }
+    let u32_at = |o: usize| u32::from_le_bytes(dib[o..o + 4].try_into().unwrap());
+    let header = u32_at(0) as usize;
+    let bits = u16::from_le_bytes([dib[14], dib[15]]) as usize;
+    let compression = u32_at(16);
+    let used = u32_at(32) as usize;
+    let masks = if compression == 3 && header == 40 { 12 } else { 0 };
+    let palette = if bits <= 8 { if used > 0 { used } else { 1 << bits } } else { used } * 4;
+    let offset = header + masks + palette;
+    if offset >= dib.len() {
+        return;
+    }
+    let (aw, ah) = (area.right - area.left, area.bottom - area.top);
+    let scale = (aw as f32 / w as f32).min(ah as f32 / h as f32).min(1.0);
+    let (dw, dh) = ((w as f32 * scale) as i32, (h as f32 * scale) as i32);
+    let x = area.left + (aw - dw) / 2;
+    let y = area.top + (ah - dh) / 2;
+    fill(dc, &RECT { left: x - 1, top: y - 1, right: x + dw + 1, bottom: y + dh + 1 }, t.divider);
+    unsafe {
+        SetStretchBltMode(dc, HALFTONE);
+        StretchDIBits(
+            dc, x, y, dw, dh, 0, 0, w, h,
+            Some(dib[offset..].as_ptr() as *const _),
+            dib.as_ptr() as *const BITMAPINFO,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
+    }
 }
 
 fn draw_list(ui: &Launcher, dc: HDC) {
@@ -90,14 +230,16 @@ fn draw_list(ui: &Launcher, dc: HDC) {
     }
 
     if ui.rows.is_empty() {
-        let msg = if ui.is_indexing_empty() {
+        let msg = if let Some(m) = &ui.list_message {
+            m.as_str()
+        } else if ui.is_indexing_empty() {
             "Indexing applications…"
         } else if ui.query_is_empty() {
             "Nothing here yet"
         } else {
             "No results"
         };
-        text(dc, msg, &lr, ui.fonts.title, t.subtext, DT_CENTER);
+        text(dc, msg, &lr, ui.fonts.title, t.subtext, DT_CENTER | DT_END_ELLIPSIS);
     }
 
     let pad = ui.s(m::PAD_X);
@@ -157,9 +299,9 @@ fn draw_list(ui: &Launcher, dc: HDC) {
                 }
 
                 // Accessory (right) then title/subtitle (left, truncated).
-                let acc_w = text_width(dc, it.accessory, ui.fonts.small);
+                let acc_w = text_width(dc, &it.accessory, ui.fonts.small);
                 let acc_rc = RECT { left: rc.right - inner - acc_w, right: rc.right - inner, ..rc };
-                text(dc, it.accessory, &acc_rc, ui.fonts.small, t.subtext, DT_RIGHT);
+                text(dc, &it.accessory, &acc_rc, ui.fonts.small, t.subtext, DT_RIGHT);
 
                 let tx = ix + icon + ui.s(12);
                 let max_right = acc_rc.left - ui.s(16);
@@ -292,22 +434,113 @@ fn draw_footer(ui: &Launcher, dc: HDC, w: i32, h: i32) {
         }
         x += sz + ui.s(8);
     }
-    let left_rc = RECT { left: x, top, right: w / 2 + ui.s(80), bottom: h };
+    let left_rc = RECT { left: x, top, right: w / 2, bottom: h };
     match ui.status() {
         Some((msg, warn)) => {
             text(dc, msg, &left_rc, ui.fonts.small, if warn { t.warn } else { t.subtext }, DT_LEFT | DT_END_ELLIPSIS)
         }
+        None if ui.mode == super::window::Mode::Clipboard => {
+            text(dc, "Delete: Shift+Del · Back: Esc", &left_rc, ui.fonts.small, t.subtext, DT_LEFT | DT_END_ELLIPSIS)
+        }
+        None if ui.mode != super::window::Mode::Root => {
+            text(dc, "Back: Esc", &left_rc, ui.fonts.small, t.subtext, DT_LEFT | DT_END_ELLIPSIS)
+        }
         None => text(dc, "SIGMA5", &left_rc, ui.fonts.header, t.subtext, DT_LEFT),
     }
 
-    // Right: primary action + Enter hint.
+    // Right: primary action + Enter, then an optional Shift+Enter action.
     if let Some(label) = ui.action_verb() {
         let right = w - ui.s(12);
         // U+E751 = "ReturnKey" glyph in Segoe Fluent Icons / MDL2.
         let kx = kbd(ui, dc, right, cy, "\u{E751}", true);
         let lw = text_width(dc, label, ui.fonts.small);
-        let lrc = RECT { left: kx - ui.s(8) - lw, top, right: kx - ui.s(8), bottom: h };
-        text(dc, label, &lrc, ui.fonts.small, t.text, DT_RIGHT);
+        let lx = kx - ui.s(8) - lw;
+        text(dc, label, &RECT { left: lx, top, right: kx - ui.s(8), bottom: h }, ui.fonts.small, t.text, DT_RIGHT);
+        if let Some(sec) = ui.secondary_hint() {
+            let sep = lx - ui.s(14);
+            fill(dc, &RECT { left: sep, top: cy - ui.s(8), right: sep + 1, bottom: cy + ui.s(8) }, t.divider);
+            let k2 = kbd(ui, dc, sep - ui.s(14), cy, "\u{E751}", true);
+            let k1 = kbd(ui, dc, k2 - ui.s(4), cy, "Shift", false);
+            let sw = text_width(dc, sec, ui.fonts.small);
+            text(dc, sec, &RECT { left: k1 - ui.s(8) - sw, top, right: k1 - ui.s(8), bottom: h }, ui.fonts.small, t.subtext, DT_RIGHT);
+        }
+    }
+}
+
+#[cfg(test)]
+mod clip_render {
+    use super::*;
+    use crate::clipboard::{Content, Entry};
+
+    /// Off-screen render of the clipboard preview (text + image) to a BMP.
+    /// `cargo test --release render_clip -- --ignored`
+    #[test]
+    #[ignore]
+    fn render_clip_preview() {
+        let out = std::env::var("SIGMA5_RENDER_OUT").unwrap_or_else(|_| "clip.bmp".into());
+        let dpi = 144u32;
+        let s = |v: i32| (v * dpi as i32 + 48) / 96;
+        let (pw, ph) = (s(440), s(372));
+        // A 320×180 gradient image as a packed 32-bit DIB.
+        let (iw, ih) = (320i32, 180i32);
+        let mut dib = Vec::new();
+        for v in [40u32, iw as u32, ih as u32] {
+            dib.extend_from_slice(&v.to_le_bytes());
+        }
+        dib.extend_from_slice(&1u16.to_le_bytes());
+        dib.extend_from_slice(&32u16.to_le_bytes());
+        dib.extend_from_slice(&[0u8; 24]);
+        for y in 0..ih {
+            for x in 0..iw {
+                dib.extend_from_slice(&[(x * 255 / iw) as u8, (y * 255 / ih) as u8, 200, 255]);
+            }
+        }
+        let entries = [
+            Entry {
+                id: 1,
+                content: Content::Text("fn main() {\n    println!(\"Hello, SIGMA5!\");\n}\n\nA longer paragraph to check that word wrapping behaves nicely inside the preview pane on the right.".into()),
+                copied: crate::util::now_unix() - 300,
+                source: String::new(),
+            },
+            Entry { id: 2, content: Content::Image { width: iw, height: ih, dib, hash: 1 }, copied: crate::util::now_unix() - 7200, source: String::new() },
+        ];
+        let total_w = pw * 2;
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: total_w, biHeight: -ph,
+                    biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let bmp = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+            SelectObject(dc, bmp.into());
+            SetBkMode(dc, TRANSPARENT);
+            let mut fonts = Fonts::create(dpi);
+            let t = crate::ui::theme::DARK;
+            fill(dc, &RECT { left: 0, top: 0, right: total_w, bottom: ph }, t.bg);
+            for (i, (e, src)) in entries.iter().zip(["Visual Studio Code", "Snipping Tool"]).enumerate() {
+                let pr = RECT { left: i as i32 * pw + 1, top: 0, right: (i as i32 + 1) * pw, bottom: ph };
+                draw_clip_preview_into(dc, pr, Some(e), src, &t, &fonts, dpi);
+            }
+            fonts.destroy();
+            let px = std::slice::from_raw_parts(bits as *const u8, (total_w * ph * 4) as usize);
+            let mut f = Vec::new();
+            f.extend_from_slice(b"BM");
+            f.extend_from_slice(&((54 + px.len()) as u32).to_le_bytes());
+            f.extend_from_slice(&[0u8; 4]);
+            f.extend_from_slice(&54u32.to_le_bytes());
+            f.extend_from_slice(&40u32.to_le_bytes());
+            f.extend_from_slice(&total_w.to_le_bytes());
+            f.extend_from_slice(&(-ph).to_le_bytes());
+            f.extend_from_slice(&1u16.to_le_bytes());
+            f.extend_from_slice(&32u16.to_le_bytes());
+            f.extend_from_slice(&[0u8; 24]);
+            f.extend_from_slice(px);
+            std::fs::write(&out, f).unwrap();
+        }
     }
 }
 

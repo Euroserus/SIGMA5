@@ -33,6 +33,18 @@ pub const EXTENSIONS: &[ExtensionInfo] = &[
         glyph: '\u{E8EF}',
     },
     ExtensionInfo {
+        id: "clipboard",
+        name: "Clipboard History",
+        description: "Remembers what you copy; private content from password managers is skipped",
+        glyph: '\u{E77F}',
+    },
+    ExtensionInfo {
+        id: "winget",
+        name: "WinGet",
+        description: "Search, install, upgrade and remove packages",
+        glyph: '\u{E7B8}',
+    },
+    ExtensionInfo {
         id: "commands",
         name: "SIGMA5 Commands",
         description: "Reload applications, open settings, quit",
@@ -56,6 +68,25 @@ pub enum Command {
     OpenSettings,
     OpenDataFolder,
     Quit,
+    WingetSearch,
+    WingetInstalled,
+    WingetUpgradable,
+    WingetUpgradeAll,
+    WingetExport,
+    WingetImport,
+    ClipboardHistory,
+    ClearClipboard,
+    CheckUpdates,
+}
+
+/// What Enter does on a WinGet package.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WingetOp {
+    Install,
+    /// Installed package: Enter upgrades if an update exists, else uninstalls.
+    Manage { has_update: bool },
+    Upgrade,
+    UpgradeAll,
 }
 
 /// What happens when a result is activated (Enter / click).
@@ -64,6 +95,11 @@ pub enum Action {
     /// Launch an entry from the shell's Apps folder (Win32 or Store app).
     LaunchApp { id: String },
     Command(Command),
+    Winget { op: WingetOp, id: String, name: String },
+    /// A clipboard history entry (by id).
+    Clip(u64),
+    /// Download and install the available SIGMA5 update.
+    Update,
 }
 
 impl Action {
@@ -72,6 +108,12 @@ impl Action {
         match self {
             Action::LaunchApp { .. } => "Open Application",
             Action::Command(_) => "Run Command",
+            Action::Winget { op: WingetOp::Install, .. } => "Install",
+            Action::Winget { op: WingetOp::Manage { has_update: false }, .. } => "Uninstall",
+            Action::Winget { op: WingetOp::Upgrade | WingetOp::Manage { .. }, .. } => "Upgrade",
+            Action::Winget { op: WingetOp::UpgradeAll, .. } => "Upgrade All",
+            Action::Clip(_) => "Paste",
+            Action::Update => "Update Now",
         }
     }
 }
@@ -84,7 +126,7 @@ pub struct Item {
     /// Dimmed text shown after the title (optional).
     pub subtitle: String,
     /// Right-aligned type label, e.g. "Application".
-    pub accessory: &'static str,
+    pub accessory: String,
     pub icon: Icon,
     pub action: Action,
     pub score: i32,
@@ -128,6 +170,8 @@ impl Row {
 pub struct Registry {
     pub apps: apps::AppsProvider,
     pub commands: commands::CommandsProvider,
+    pub winget: commands::CommandsProvider,
+    pub clipboard: commands::CommandsProvider,
     /// Extension ids turned off in settings.
     pub disabled: Vec<String>,
 }
@@ -136,13 +180,15 @@ impl Registry {
     pub fn new() -> Self {
         Self {
             apps: apps::AppsProvider::new(),
-            commands: commands::CommandsProvider,
+            commands: commands::SIGMA5,
+            winget: commands::WINGET,
+            clipboard: commands::CLIPBOARD,
             disabled: Vec::new(),
         }
     }
 
     fn enabled(&self) -> Vec<&dyn Provider> {
-        let all: [&dyn Provider; 2] = [&self.apps, &self.commands];
+        let all: [&dyn Provider; 4] = [&self.apps, &self.clipboard, &self.winget, &self.commands];
         all.into_iter().filter(|p| !self.disabled.iter().any(|d| d == p.id())).collect()
     }
 

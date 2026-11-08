@@ -115,6 +115,8 @@ impl ThemeMode {
 pub struct Config {
     /// Global shortcut that toggles the launcher, e.g. "Alt+Space".
     pub hotkey: String,
+    /// Optional shortcut that opens Clipboard History directly (empty = none).
+    pub clipboard_hotkey: String,
     pub theme: ThemeMode,
     pub accent: Accent,
     pub size: UiSize,
@@ -122,6 +124,8 @@ pub struct Config {
     pub windows_key: bool,
     /// Adds/removes SIGMA5 from HKCU\...\Run so it starts at login.
     pub start_with_windows: bool,
+    /// Check GitHub for new versions in the background.
+    pub auto_update: bool,
     /// Reopening within this many seconds keeps your last search.
     pub keep_query_secs: u64,
     /// Number of recently used items shown when the search box is empty.
@@ -138,11 +142,13 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             hotkey: "Alt+Space".into(),
+            clipboard_hotkey: String::new(),
             theme: ThemeMode::default(),
             accent: Accent::default(),
             size: UiSize::default(),
             windows_key: false,
             start_with_windows: false,
+            auto_update: true,
             keep_query_secs: 30,
             recent_count: 6,
             disabled_extensions: Vec::new(),
@@ -214,6 +220,9 @@ impl Config {
 # Modifiers: Ctrl, Alt, Shift, Win. Keys: A-Z, 0-9, F1-F24, Space, Enter, Tab, `
 hotkey = {hotkey:?}
 
+# Optional shortcut that opens Clipboard History directly, e.g. "Ctrl+Shift+V" (empty = none).
+clipboard_hotkey = {clip_hotkey:?}
+
 # "system", "dark" or "light"
 theme = "{theme}"
 
@@ -229,6 +238,9 @@ windows_key = {wk}
 # Launch SIGMA5 automatically when you sign in to Windows.
 start_with_windows = {sww}
 
+# Check for new versions in the background (about once every 12 hours).
+auto_update = {au}
+
 # Reopening within this many seconds keeps your last search (0 = never).
 keep_query_secs = {kq}
 
@@ -239,12 +251,14 @@ recent_count = {rc}
 disabled_extensions = [{disabled}]
 "#,
             hotkey = self.hotkey,
+            clip_hotkey = self.clipboard_hotkey,
             theme = self.theme.as_str(),
             accents = accents.join(", "),
             accent = self.accent.as_str(),
             size = self.size.as_str(),
             wk = self.windows_key,
             sww = self.start_with_windows,
+            au = self.auto_update,
             kq = self.keep_query_secs,
             rc = self.recent_count,
             disabled = disabled.join(", "),
@@ -332,11 +346,13 @@ mod tests {
     fn toml_round_trip() {
         let mut c = Config::default();
         c.hotkey = "Ctrl+Shift+K".into();
+        c.clipboard_hotkey = "Ctrl+Alt+Shift+V".into();
         c.theme = ThemeMode::Light;
         c.accent = Accent::Teal;
         c.size = UiSize::Large;
         c.start_with_windows = true;
         c.windows_key = true;
+        c.auto_update = false;
         c.keep_query_secs = 120;
         c.recent_count = 3;
         c.disabled_extensions = vec!["commands".into()];

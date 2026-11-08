@@ -25,7 +25,7 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_NEXT, VK_PRIOR,
-    VK_RETURN, VK_SHIFT, VK_TAB, VK_UP,
+    VK_DELETE, VK_RETURN, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -36,7 +36,10 @@ use super::draw::BackBuffer;
 use super::paint::{self, Fonts};
 use super::settings;
 use super::input;
-use super::{WM_APP_APP_PICKED, WM_APP_CLEAR_HISTORY, WM_APP_CONFIG_CHANGED, WM_APP_PICK_APP, WM_APP_WINKEY};
+use super::{
+    WM_APP_APP_PICKED, WM_APP_CHECK_UPDATE, WM_APP_CLEAR_HISTORY, WM_APP_CONFIG_CHANGED, WM_APP_PICK_APP, WM_APP_UPDATE,
+    WM_APP_WINGET, WM_APP_WINKEY,
+};
 use super::theme::{self, Theme, metrics as m};
 use super::{hotkey, tray};
 use super::{
@@ -103,7 +106,84 @@ pub struct Launcher {
     /// Calculator answer left in the search box after Enter (shown until edited).
     calc_hold: Option<crate::calc::Calc>,
     pulse_start: Option<Instant>,
+
+    /// Which page the launcher shows (root search, WinGet, clipboard).
+    pub mode: Mode,
+    /// Root search text to restore when going back.
+    root_query: String,
+    winget: WingetState,
+    pub clip: crate::clipboard::History,
+    clip_listening: bool,
+    /// Shown in the list area when there are no rows (loading, errors, hints).
+    pub list_message: Option<String>,
+    /// Window that was active before the launcher opened (paste target).
+    prev_foreground: HWND,
+    /// A newer release found by the update check.
+    update: Option<crate::update::UpdateInfo>,
+    /// An update check or download is in flight.
+    update_busy: bool,
 }
+
+/// Posted by update worker threads.
+pub enum UpdateEvent {
+    Checked { manual: bool, result: Result<Option<crate::update::UpdateInfo>, String> },
+    Progress(u8),
+    Downloaded(Result<std::path::PathBuf, String>),
+}
+
+const UPDATE_TIMER: usize = 10;
+/// First check shortly after startup, then every 12 hours.
+const UPDATE_FIRST_MS: u32 = 30_000;
+const UPDATE_EVERY_MS: u32 = 12 * 60 * 60 * 1000;
+
+/// The launcher's pages. Sub-pages have their own search box contents and
+/// return to the root with Esc (or Backspace on an empty box).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Root,
+    Winget(crate::winget::Query),
+    Clipboard,
+}
+
+impl Mode {
+    pub fn title(self) -> &'static str {
+        match self {
+            Mode::Root => "SIGMA5",
+            Mode::Winget(crate::winget::Query::Search) => "WinGet · Search",
+            Mode::Winget(crate::winget::Query::Installed) => "WinGet · Installed",
+            Mode::Winget(crate::winget::Query::Upgradable) => "WinGet · Upgradable",
+            Mode::Clipboard => "Clipboard History",
+        }
+    }
+
+    fn placeholder(self) -> &'static str {
+        match self {
+            Mode::Root => "Search for apps and commands…",
+            Mode::Winget(crate::winget::Query::Search) => "Search WinGet packages…",
+            Mode::Winget(_) => "Filter packages…",
+            Mode::Clipboard => "Search clipboard history…",
+        }
+    }
+}
+
+#[derive(Default)]
+struct WingetState {
+    packages: Vec<crate::winget::Package>,
+    loading: bool,
+    error: Option<String>,
+    /// Bumped per query so stale results are ignored.
+    generation: u64,
+    /// Search text the current results are for.
+    searched: String,
+}
+
+/// Result posted by a WinGet worker thread.
+pub struct WingetResult {
+    generation: u64,
+    result: Result<Vec<crate::winget::Package>, String>,
+}
+
+const WINGET_TIMER: usize = 9;
 
 impl Launcher {
     // ----- geometry -------------------------------------------------------
@@ -125,9 +205,60 @@ impl Launcher {
         (rc.right - rc.left, rc.bottom - rc.top)
     }
 
+    /// The area rows are drawn in (the left pane in Clipboard mode).
     pub fn list_rect(&self) -> RECT {
         let (w, h) = self.client_size();
-        RECT { left: 0, top: self.s(m::SEARCH_H) + 1, right: w, bottom: h - self.s(m::FOOTER_H) }
+        let right = if self.mode == Mode::Clipboard { w * 41 / 100 } else { w };
+        RECT { left: 0, top: self.s(m::SEARCH_H) + 1, right, bottom: h - self.s(m::FOOTER_H) }
+    }
+
+    /// Clipboard preview pane (right of the list).
+    pub fn preview_rect(&self) -> RECT {
+        let (w, _) = self.client_size();
+        let lr = self.list_rect();
+        RECT { left: lr.right + 1, right: w, ..lr }
+    }
+
+    /// Back arrow in the search bar (sub-pages only).
+    pub fn back_rect(&self) -> Option<RECT> {
+        (self.mode != Mode::Root).then(|| {
+            let cy = self.s(m::SEARCH_H) / 2;
+            let x = self.s(12);
+            RECT { left: x, top: cy - self.s(14), right: x + self.s(28), bottom: cy + self.s(14) }
+        })
+    }
+
+    /// Friendly name for a source exe ("chrome.exe" → "Google Chrome").
+    pub fn source_name(&self, exe: &str) -> String {
+        if exe.is_empty() {
+            return "Unknown".into();
+        }
+        if let Some(n) = self.registry.apps.name_for_exe(exe) {
+            return n.to_string();
+        }
+        let stem = exe.strip_suffix(".exe").unwrap_or(exe);
+        let mut c = stem.chars();
+        c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+    }
+
+    /// The clipboard entry selected in Clipboard mode.
+    pub fn selected_clip(&self) -> Option<&crate::clipboard::Entry> {
+        match self.selected_action()? {
+            Action::Clip(id) => self.clip.get(*id),
+            _ => None,
+        }
+    }
+
+    /// Secondary action shown in the footer: (label, needs Shift+Enter).
+    pub fn secondary_hint(&self) -> Option<&'static str> {
+        match self.selected_action()? {
+            Action::Clip(_) => Some("Copy"),
+            Action::Update => Some("Release Notes"),
+            Action::Winget { op: crate::providers::WingetOp::Manage { has_update: true } | crate::providers::WingetOp::Upgrade, .. } => {
+                Some("Uninstall")
+            }
+            _ => None,
+        }
     }
 
     pub fn row_height(&self, row: &Row) -> i32 {
@@ -272,6 +403,15 @@ impl Launcher {
             app_hotkeys_registered: 0,
             calc_hold: None,
             pulse_start: None,
+            mode: Mode::Root,
+            root_query: String::new(),
+            winget: WingetState::default(),
+            clip: crate::clipboard::History::load(),
+            clip_listening: false,
+            list_message: None,
+            prev_foreground: HWND::default(),
+            update: None,
+            update_busy: false,
         });
         me.create_edit();
         me.apply_dpi(dpi, false);
@@ -280,7 +420,118 @@ impl Launcher {
         me.apply_config(true);
         me.refresh_rows(false);
         me.start_index(false);
+        me.after_start();
         me
+    }
+
+    /// Update housekeeping at startup: clean old downloads, announce a
+    /// just-installed version, and schedule the first update check.
+    fn after_start(&mut self) {
+        crate::update::cleanup();
+        let marker = data_dir().join("last_version.txt");
+        let last = std::fs::read_to_string(&marker).unwrap_or_default();
+        if !last.trim().is_empty() && last.trim() != crate::install::VERSION {
+            tray::notify(self.hwnd, "SIGMA5 updated", &format!("You're now on {}", crate::install::version_label()), false);
+        }
+        let _ = std::fs::write(&marker, crate::install::VERSION);
+        unsafe {
+            SetTimer(Some(self.hwnd), UPDATE_TIMER, UPDATE_FIRST_MS, None);
+        }
+    }
+
+    fn on_update_timer(&mut self) {
+        unsafe {
+            SetTimer(Some(self.hwnd), UPDATE_TIMER, UPDATE_EVERY_MS, None);
+        }
+        if self.config.config.auto_update {
+            self.start_update_check(false);
+        }
+    }
+
+    /// Checks GitHub on a worker thread; `manual` reports "up to date" too.
+    fn start_update_check(&mut self, manual: bool) {
+        if self.update_busy {
+            return;
+        }
+        self.update_busy = true;
+        if manual {
+            self.set_status("Checking for updates…", false, None);
+        }
+        let hwnd = SendHwnd::new(self.hwnd);
+        let _ = std::thread::Builder::new().name("sigma5-update".into()).spawn(move || {
+            post_update(hwnd, UpdateEvent::Checked { manual, result: crate::update::check() });
+        });
+    }
+
+    fn start_update_download(&mut self) {
+        let Some(info) = self.update.clone() else { return };
+        if self.update_busy {
+            return;
+        }
+        self.update_busy = true;
+        self.set_status(format!("Downloading {}…", info.label()), false, None);
+        let hwnd = SendHwnd::new(self.hwnd);
+        let _ = std::thread::Builder::new().name("sigma5-update".into()).spawn(move || {
+            let mut last = 255u8;
+            let result = crate::update::download(&info, |got, total| {
+                let pct = if total > 0 { (got * 100 / total) as u8 } else { 0 };
+                if pct != last && pct % 5 == 0 {
+                    last = pct;
+                    post_update(hwnd, UpdateEvent::Progress(pct));
+                }
+            });
+            post_update(hwnd, UpdateEvent::Downloaded(result));
+        });
+    }
+
+    fn on_update_event(&mut self, ev: UpdateEvent) {
+        let tell = |me: &mut Self, title: &str, body: &str, warn: bool| {
+            me.set_status(body.to_string(), warn, Some(Duration::from_secs(6)));
+            unsafe {
+                SetTimer(Some(me.hwnd), STATUS_TIMER, 6100, None);
+            }
+            if !me.visible {
+                tray::notify(me.hwnd, title, body, warn);
+            }
+        };
+        match ev {
+            UpdateEvent::Checked { manual, result } => {
+                self.update_busy = false;
+                match result {
+                    Ok(Some(info)) => {
+                        let new = self.update.as_ref() != Some(&info);
+                        let msg = format!("SIGMA5 {} is available", info.label());
+                        self.update = Some(info);
+                        if new || manual {
+                            tell(self, "Update available", &format!("{msg}. Open SIGMA5 to update."), false);
+                        }
+                        self.refresh_rows(true);
+                    }
+                    Ok(None) if manual => {
+                        let msg = format!("You're up to date: {}", crate::install::version_label());
+                        tell(self, "SIGMA5", &msg, false);
+                    }
+                    Err(e) if manual => tell(self, "Update check failed", &e, true),
+                    _ => {}
+                }
+            }
+            UpdateEvent::Progress(p) => {
+                let label = self.update.as_ref().map(|u| u.label()).unwrap_or_default();
+                self.set_status(format!("Downloading {label}… {p}%"), false, None);
+            }
+            UpdateEvent::Downloaded(Ok(path)) => {
+                self.set_status("Installing update…", false, None);
+                if let Err(e) = crate::update::apply(&path) {
+                    self.update_busy = false;
+                    tell(self, "Update failed", &e, true);
+                }
+                // On success the new version's installer closes this copy.
+            }
+            UpdateEvent::Downloaded(Err(e)) => {
+                self.update_busy = false;
+                tell(self, "Update failed", &e, true);
+            }
+        }
     }
 
     fn create_edit(&mut self) {
@@ -338,10 +589,13 @@ impl Launcher {
         let (w, _) = self.client_size();
         let w = if w <= 0 { self.s(m::WIDTH) } else { w };
         let th = text_height(self.fonts.search);
-        let x = self.s(m::TEXT_X) - self.s(3);
+        let sub = self.mode != Mode::Root;
+        // Sub-pages: back arrow on the left, page title on the right.
+        let x = self.s(m::TEXT_X) - self.s(3) + if sub { self.s(30) } else { 0 };
+        let right_pad = if sub { self.s(190) } else { self.s(m::TEXT_X) - self.s(3) };
         let y = (self.s(m::SEARCH_H) - th) / 2;
         unsafe {
-            let _ = SetWindowPos(self.edit, None, x, y, w - 2 * x, th, SWP_NOZORDER | SWP_NOACTIVATE);
+            let _ = SetWindowPos(self.edit, None, x, y, w - x - right_pad, th, SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
 
@@ -372,6 +626,24 @@ impl Launcher {
         input::configure(self.hwnd, input::Rules { win_tap: cfg.windows_key, remaps: cfg.key_rules() });
         self.register_app_hotkeys(&cfg);
         self.registry.disabled = cfg.disabled_extensions.clone();
+
+        // Clipboard history: listen only while the extension is on.
+        let want_clip = cfg.extension_enabled("clipboard");
+        unsafe {
+            use windows::Win32::System::DataExchange::{AddClipboardFormatListener, RemoveClipboardFormatListener};
+            if want_clip && !self.clip_listening {
+                self.clip_listening = AddClipboardFormatListener(self.hwnd).is_ok();
+            } else if !want_clip && self.clip_listening {
+                let _ = RemoveClipboardFormatListener(self.hwnd);
+                self.clip_listening = false;
+            }
+        }
+        hotkey::unregister(self.hwnd, hotkey::CLIPBOARD_HOTKEY_ID);
+        if want_clip && !cfg.clipboard_hotkey.trim().is_empty() {
+            if let Err(e) = hotkey::register_id(self.hwnd, hotkey::CLIPBOARD_HOTKEY_ID, &cfg.clipboard_hotkey) {
+                self.set_status(format!("Clipboard hotkey: {e}"), true, None);
+            }
+        }
 
         let t = theme::resolve(cfg.theme, cfg.accent);
         if t != self.theme || first {
@@ -495,8 +767,30 @@ impl Launcher {
             }))
             .flatten();
         let q = Query::new(&self.query);
-        self.rows = self.registry.rows(&q, &self.history, self.config.config.recent_count);
-        if self.pick_for.is_some() {
+        self.list_message = None;
+        match self.mode {
+            Mode::Root => self.rows = self.registry.rows(&q, &self.history, self.config.config.recent_count),
+            Mode::Winget(kind) => self.rows = self.winget_rows(kind, &q),
+            Mode::Clipboard => self.rows = self.clip_rows(&q),
+        }
+        // Update banner at the top of the root page.
+        if let (Mode::Root, None, Some(info)) = (self.mode, self.pick_for, &self.update) {
+            if q.is_empty() || q.score("update sigma5 new version").is_some() {
+                let item = crate::providers::Item {
+                    key: "update".into(),
+                    title: format!("Update to SIGMA5 {}", info.label()),
+                    subtitle: format!("You have {}", crate::install::version_label()),
+                    accessory: "Update".into(),
+                    icon: crate::providers::Icon::Glyph('\u{E896}'),
+                    action: Action::Update,
+                    score: 0,
+                };
+                self.rows.splice(0..0, [Row::Header("Update Available"), Row::Item(item)]);
+            }
+        }
+        if self.mode != Mode::Root {
+            // Sub-pages have no calculator or pick mode.
+        } else if self.pick_for.is_some() {
             // Pick mode: apps only, and drop headers left with no items.
             let rows = std::mem::take(&mut self.rows);
             let kept: Vec<Row> = rows
@@ -548,13 +842,304 @@ impl Launcher {
                 self.calc_hold = None;
             }
             self.query = text;
+            if self.mode == Mode::Winget(crate::winget::Query::Search) {
+                // Debounce: search once typing pauses.
+                unsafe {
+                    SetTimer(Some(self.hwnd), WINGET_TIMER, 350, None);
+                }
+            }
             self.refresh_rows(false);
+        }
+    }
+
+    // ----- pages: WinGet & clipboard ---------------------------------------
+
+    /// Opens a sub-page with an empty search box.
+    fn enter_mode(&mut self, mode: Mode) {
+        if self.mode == Mode::Root {
+            self.root_query = self.query.clone();
+        }
+        self.mode = mode;
+        self.set_search_text("");
+        self.set_placeholder(mode.placeholder());
+        self.layout_edit();
+        if let Mode::Winget(kind) = mode {
+            self.winget = WingetState::default();
+            if kind != crate::winget::Query::Search {
+                self.start_winget_query(kind, String::new());
+            }
+        }
+        self.refresh_rows(false);
+    }
+
+    /// Back to the root search, restoring what was typed there.
+    fn go_back(&mut self) {
+        if self.mode == Mode::Root {
+            return;
+        }
+        self.mode = Mode::Root;
+        let q = std::mem::take(&mut self.root_query);
+        self.set_search_text(&q);
+        self.set_placeholder(Mode::Root.placeholder());
+        self.layout_edit();
+        self.refresh_rows(false);
+    }
+
+    fn set_search_text(&mut self, text: &str) {
+        self.query = text.to_string();
+        let w = wide(text);
+        unsafe {
+            let _ = SetWindowTextW(self.edit, PCWSTR(w.as_ptr()));
+            let end = (w.len() - 1) as isize;
+            SendMessageW(self.edit, EM_SETSEL, Some(WPARAM(end as usize)), Some(LPARAM(end)));
+        }
+    }
+
+    fn set_placeholder(&self, text: &str) {
+        let cue = wide(text);
+        unsafe {
+            SendMessageW(self.edit, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(cue.as_ptr() as isize)));
+        }
+    }
+
+    fn start_winget_query(&mut self, kind: crate::winget::Query, text: String) {
+        self.winget.generation += 1;
+        self.winget.loading = true;
+        self.winget.error = None;
+        self.winget.searched = text.clone();
+        let generation = self.winget.generation;
+        let hwnd = SendHwnd::new(self.hwnd);
+        let _ = std::thread::Builder::new().name("sigma5-winget".into()).spawn(move || {
+            let result = crate::winget::query(kind, &text);
+            let boxed = Box::into_raw(Box::new(WingetResult { generation, result }));
+            unsafe {
+                if PostMessageW(Some(hwnd.get()), WM_APP_WINGET, WPARAM(0), LPARAM(boxed as isize)).is_err() {
+                    drop(Box::from_raw(boxed));
+                }
+            }
+        });
+    }
+
+    fn on_winget_result(&mut self, r: WingetResult) {
+        if r.generation != self.winget.generation {
+            return; // superseded by a newer query
+        }
+        self.winget.loading = false;
+        match r.result {
+            Ok(p) => self.winget.packages = p,
+            Err(e) => {
+                self.winget.packages.clear();
+                self.winget.error = Some(e);
+            }
+        }
+        if matches!(self.mode, Mode::Winget(_)) {
+            self.refresh_rows(false);
+        }
+    }
+
+    fn on_winget_timer(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), WINGET_TIMER);
+        }
+        let text = self.query.trim().to_string();
+        if self.mode == Mode::Winget(crate::winget::Query::Search) && text != self.winget.searched {
+            if text.is_empty() {
+                self.winget = WingetState::default();
+                self.refresh_rows(false);
+            } else {
+                self.start_winget_query(crate::winget::Query::Search, text);
+                self.refresh_rows(false);
+            }
+        }
+    }
+
+    fn winget_rows(&mut self, kind: crate::winget::Query, q: &Query) -> Vec<Row> {
+        use crate::providers::{Icon, Item, WingetOp};
+        use crate::winget::Query as K;
+        let w = &self.winget;
+        let mut rows = Vec::new();
+        // Search results are already filtered by winget; local lists filter here.
+        let mut pkgs: Vec<(i32, &crate::winget::Package)> = w
+            .packages
+            .iter()
+            .filter_map(|p| {
+                if kind == K::Search || q.is_empty() {
+                    return Some((0, p));
+                }
+                q.score(&p.name).max(q.score(&p.id).map(|s| s - 10)).map(|s| (s, p))
+            })
+            .collect();
+        if kind != K::Search && !q.is_empty() {
+            pkgs.sort_by(|a, b| b.0.cmp(&a.0));
+        }
+        let glyph = '\u{E7B8}';
+        if kind == K::Upgradable && q.is_empty() && pkgs.len() > 1 {
+            rows.push(Row::Header("Actions"));
+            rows.push(Row::Item(Item {
+                key: "winget:all".into(),
+                title: format!("Upgrade All ({})", pkgs.len()),
+                subtitle: "WinGet".into(),
+                accessory: String::new(),
+                icon: Icon::Glyph('\u{E777}'),
+                action: Action::Winget { op: WingetOp::UpgradeAll, id: String::new(), name: String::new() },
+                score: 0,
+            }));
+        }
+        if !pkgs.is_empty() {
+            rows.push(Row::Header(match kind {
+                K::Search => "Packages",
+                K::Installed => "Installed",
+                K::Upgradable => "Updates Available",
+            }));
+        }
+        for (_, p) in pkgs {
+            let has_update = !p.available.is_empty();
+            let op = match kind {
+                K::Search => WingetOp::Install,
+                K::Installed => WingetOp::Manage { has_update },
+                K::Upgradable => WingetOp::Upgrade,
+            };
+            let accessory = if has_update { format!("{} → {}", p.version, p.available) } else { p.version.clone() };
+            rows.push(Row::Item(Item {
+                key: format!("winget:{}", p.id),
+                title: p.name.clone(),
+                subtitle: p.id.clone(),
+                accessory,
+                icon: Icon::Glyph(glyph),
+                action: Action::Winget { op, id: p.id.clone(), name: p.name.clone() },
+                score: 0,
+            }));
+        }
+        if rows.is_empty() {
+            self.list_message = Some(if let Some(e) = &w.error {
+                e.clone()
+            } else if w.loading {
+                match kind {
+                    K::Search => format!("Searching WinGet for “{}”…", w.searched),
+                    K::Installed => "Loading installed packages…".into(),
+                    K::Upgradable => "Checking for updates…".into(),
+                }
+            } else if kind == K::Search && self.query.trim().is_empty() {
+                "Type to search the WinGet catalogue".into()
+            } else if kind == K::Upgradable && q.is_empty() {
+                "Everything is up to date".into()
+            } else {
+                "No packages found".into()
+            });
+        }
+        rows
+    }
+
+    fn clip_rows(&mut self, q: &Query) -> Vec<Row> {
+        use crate::clipboard::Content;
+        use crate::providers::{Icon, Item};
+        let mut rows = Vec::new();
+        let now = crate::util::now_unix();
+        let mut section = "";
+        for e in self.clip.entries() {
+            if !q.is_empty() && q.score(&e.content.search_text()).is_none() {
+                continue;
+            }
+            let age = now.saturating_sub(e.copied);
+            let s = if age < 86_400 { "Today" } else if age < 2 * 86_400 { "Yesterday" } else { "Earlier" };
+            if s != section {
+                rows.push(Row::Header(s));
+                section = s;
+            }
+            let glyph = match e.content {
+                Content::Text(_) => '\u{E8C4}',
+                Content::Files(_) => '\u{E8B7}',
+                Content::Image { .. } => '\u{EB9F}',
+            };
+            rows.push(Row::Item(Item {
+                key: format!("clip:{}", e.id),
+                title: e.content.title(),
+                subtitle: String::new(),
+                accessory: crate::util::ago(e.copied),
+                icon: Icon::Glyph(glyph),
+                action: Action::Clip(e.id),
+                score: 0,
+            }));
+        }
+        if rows.is_empty() {
+            self.list_message = Some(if self.clip.entries().is_empty() {
+                "Copy something and it will appear here".into()
+            } else {
+                "No matches".into()
+            });
+        }
+        rows
+    }
+
+    fn on_clipboard_update(&mut self) {
+        if self.clip.capture(self.hwnd) && self.visible && self.mode == Mode::Clipboard {
+            self.refresh_rows(true);
+        }
+    }
+
+    /// Enter / Shift+Enter on a WinGet package.
+    fn activate_winget(&mut self, op: crate::providers::WingetOp, id: &str, name: &str, shift: bool) {
+        use crate::providers::WingetOp;
+        self.allow_foreground();
+        match (op, shift) {
+            (WingetOp::UpgradeAll, _) => crate::winget::upgrade_all(),
+            (WingetOp::Install, _) => crate::winget::install(id, name),
+            (WingetOp::Manage { has_update: false }, _) | (WingetOp::Manage { .. } | WingetOp::Upgrade, true) => {
+                crate::winget::uninstall(id, name)
+            }
+            (WingetOp::Manage { .. } | WingetOp::Upgrade, false) => crate::winget::upgrade(id, name),
+        }
+        self.reset_on_show = true;
+        self.hide();
+    }
+
+    /// Enter pastes into the previous window; Shift+Enter only copies.
+    fn activate_clip(&mut self, id: u64, shift: bool) {
+        if !self.clip.restore(id, self.hwnd) {
+            self.set_status("Clipboard is busy; try again", true, Some(Duration::from_secs(3)));
+            return;
+        }
+        if shift {
+            self.set_status("Copied to clipboard", false, Some(Duration::from_millis(1800)));
+            unsafe {
+                SetTimer(Some(self.hwnd), STATUS_TIMER, 1900, None);
+            }
+            return;
+        }
+        let target = self.prev_foreground;
+        self.reset_on_show = true;
+        self.hide();
+        if !target.is_invalid() {
+            crate::focus::activate(target);
+            // Give focus a moment to land, then press Ctrl+V.
+            let _ = std::thread::Builder::new().name("sigma5-paste".into()).spawn(|| {
+                std::thread::sleep(Duration::from_millis(60));
+                input::send_paste();
+            });
+        }
+    }
+
+    fn delete_selected_clip(&mut self) {
+        if let Some(Action::Clip(id)) = self.selected_action().cloned() {
+            self.clip.remove(id);
+            self.refresh_rows(true);
+        }
+    }
+
+    fn allow_foreground(&self) {
+        unsafe {
+            let _ = AllowSetForegroundWindow(ASFW_ANY);
         }
     }
 
     // ----- visibility ------------------------------------------------------
 
     fn show(&mut self) {
+        // Remember where the user was, so clipboard entries can be pasted there.
+        let fg = unsafe { GetForegroundWindow() };
+        if fg != self.hwnd && !fg.is_invalid() {
+            self.prev_foreground = fg;
+        }
         if self.config.reload_if_changed() {
             self.apply_config(false);
         }
@@ -587,10 +1172,18 @@ impl Launcher {
         let expired = self
             .hidden_at
             .is_none_or(|t| t.elapsed() >= Duration::from_secs(self.config.config.keep_query_secs));
-        if (self.reset_on_show || expired) && !self.query.is_empty() {
-            self.query.clear();
-            unsafe {
-                let _ = SetWindowTextW(self.edit, w!(""));
+        if self.reset_on_show || expired {
+            if self.mode != Mode::Root {
+                self.mode = Mode::Root;
+                self.root_query.clear();
+                self.set_placeholder(Mode::Root.placeholder());
+                self.layout_edit();
+            }
+            if !self.query.is_empty() {
+                self.query.clear();
+                unsafe {
+                    let _ = SetWindowTextW(self.edit, w!(""));
+                }
             }
         }
         self.reset_on_show = false;
@@ -691,20 +1284,25 @@ impl Launcher {
             VK_PRIOR => self.move_selection(-page, false),
             VK_RETURN => {
                 if let Some(i) = self.selected {
-                    self.activate(i);
+                    self.activate(i, shift);
                 }
             }
             VK_ESCAPE => {
                 if !self.query.is_empty() && !ctrl {
-                    self.query.clear();
-                    unsafe {
-                        let _ = SetWindowTextW(self.edit, w!(""));
+                    self.set_search_text("");
+                    if self.mode == Mode::Winget(crate::winget::Query::Search) {
+                        self.winget = WingetState::default();
                     }
                     self.refresh_rows(false);
+                } else if self.mode != Mode::Root && !ctrl {
+                    self.go_back();
                 } else {
                     self.hide();
                 }
             }
+            // Backspace on an empty box (sent by the search box) goes back.
+            VK_BACK => self.go_back(),
+            VK_DELETE if shift && self.mode == Mode::Clipboard => self.delete_selected_clip(),
             // Ctrl+, opens settings.
             VIRTUAL_KEY(0xBC) if ctrl => self.open_settings(),
             _ => {}
@@ -754,7 +1352,7 @@ impl Launcher {
         self.invalidate();
     }
 
-    fn activate(&mut self, idx: usize) {
+    fn activate(&mut self, idx: usize, shift: bool) {
         if let Some(Row::Calc(c)) = self.rows.get(idx) {
             let c = (**c).clone();
             self.activate_calc(c);
@@ -762,6 +1360,32 @@ impl Launcher {
         }
         let Some(Row::Item(it)) = self.rows.get(idx) else { return };
         let (key, action) = (it.key.clone(), it.action.clone());
+        match &action {
+            Action::Winget { op, id, name } => {
+                let (op, id, name) = (*op, id.clone(), name.clone());
+                self.activate_winget(op, &id, &name, shift);
+                return;
+            }
+            Action::Clip(id) => {
+                let id = *id;
+                self.activate_clip(id, shift);
+                return;
+            }
+            Action::Update => {
+                if shift {
+                    // Shift+Enter: read the release notes first.
+                    if let Some(u) = &self.update {
+                        self.allow_foreground();
+                        crate::launch::open_url(&u.page_url);
+                        self.hide();
+                    }
+                } else {
+                    self.start_update_download();
+                }
+                return;
+            }
+            _ => {}
+        }
         if let (Some(settings), Action::LaunchApp { id }) = (self.pick_for, &action) {
             // Pick mode: hand the app to Settings instead of launching it.
             let picked = Box::into_raw(Box::new((id.clone(), it.title.clone())));
@@ -785,6 +1409,7 @@ impl Launcher {
                 self.hide();
             }
             Action::Command(c) => self.run_command(c),
+            Action::Winget { .. } | Action::Clip(_) | Action::Update => {}
         }
     }
 
@@ -809,6 +1434,45 @@ impl Launcher {
             Command::Quit => unsafe {
                 let _ = PostMessageW(Some(self.hwnd), WM_APP_QUIT, WPARAM(0), LPARAM(0));
             },
+            Command::WingetSearch => self.enter_mode(Mode::Winget(crate::winget::Query::Search)),
+            Command::WingetInstalled => self.enter_mode(Mode::Winget(crate::winget::Query::Installed)),
+            Command::WingetUpgradable => self.enter_mode(Mode::Winget(crate::winget::Query::Upgradable)),
+            Command::WingetUpgradeAll | Command::WingetExport | Command::WingetImport => {
+                self.allow_foreground();
+                match c {
+                    Command::WingetUpgradeAll => crate::winget::upgrade_all(),
+                    Command::WingetExport => crate::winget::export(),
+                    _ => crate::winget::import(),
+                }
+                self.reset_on_show = true;
+                self.hide();
+            }
+            Command::ClipboardHistory => self.enter_mode(Mode::Clipboard),
+            Command::CheckUpdates => self.start_update_check(true),
+            Command::ClearClipboard => {
+                self.clip.clear();
+                self.set_search_text("");
+                self.refresh_rows(false);
+                self.set_status("Clipboard history cleared", false, Some(Duration::from_secs(3)));
+                unsafe {
+                    SetTimer(Some(self.hwnd), STATUS_TIMER, 3100, None);
+                }
+            }
+        }
+    }
+
+    /// The clipboard hotkey: open straight on Clipboard History (or close it).
+    fn toggle_clipboard(&mut self) {
+        let fg = unsafe { GetForegroundWindow() };
+        if self.visible && fg == self.hwnd && self.mode == Mode::Clipboard {
+            self.hide();
+            return;
+        }
+        if !self.visible || fg != self.hwnd {
+            self.show();
+        }
+        if self.mode != Mode::Clipboard {
+            self.enter_mode(Mode::Clipboard);
         }
     }
 
@@ -954,6 +1618,15 @@ pub fn run_message_loop() {
     }
 }
 
+fn post_update(hwnd: SendHwnd, ev: UpdateEvent) {
+    let raw = Box::into_raw(Box::new(ev));
+    unsafe {
+        if PostMessageW(Some(hwnd.get()), WM_APP_UPDATE, WPARAM(0), LPARAM(raw as isize)).is_err() {
+            drop(Box::from_raw(raw));
+        }
+    }
+}
+
 fn post(hwnd: HWND, msg: u32) {
     unsafe {
         let _ = PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(0));
@@ -1040,6 +1713,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let id = wp.0 as i32;
             if id == hotkey::HOTKEY_ID {
                 ui.toggle();
+            } else if id == hotkey::CLIPBOARD_HOTKEY_ID {
+                ui.toggle_clipboard();
             } else if id >= hotkey::APP_HOTKEY_BASE {
                 ui.on_app_hotkey((id - hotkey::APP_HOTKEY_BASE) as usize);
             }
@@ -1089,6 +1764,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             ui.toggle();
             LRESULT(0)
         }
+        WM_APP_WINGET => {
+            let r = unsafe { Box::from_raw(lp.0 as *mut WingetResult) };
+            ui.on_winget_result(*r);
+            LRESULT(0)
+        }
+        WM_CLIPBOARDUPDATE => {
+            ui.on_clipboard_update();
+            LRESULT(0)
+        }
         WM_APP_CONFIG_CHANGED => {
             ui.on_config_changed();
             LRESULT(0)
@@ -1123,15 +1807,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_LBUTTONUP => {
             let (x, y) = point_from_lparam(lp);
+            if ui.back_rect().is_some_and(|r| super::draw::contains(&r, x, y)) {
+                ui.go_back();
+                return LRESULT(0);
+            }
             let hit = ui.hit_test(x, y);
             if hit.is_some() && hit == ui.press_row.take() {
-                ui.activate(hit.unwrap());
+                ui.activate(hit.unwrap(), key_down(VK_SHIFT));
             }
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
             let delta = hiword(wp.0) as u16 as i16 as i32;
             ui.on_wheel(delta);
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == WINGET_TIMER => {
+            ui.on_winget_timer();
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == UPDATE_TIMER => {
+            ui.on_update_timer();
+            LRESULT(0)
+        }
+        WM_APP_UPDATE => {
+            let ev = unsafe { Box::from_raw(lp.0 as *mut UpdateEvent) };
+            ui.on_update_event(*ev);
+            LRESULT(0)
+        }
+        WM_APP_CHECK_UPDATE => {
+            ui.start_update_check(true);
             LRESULT(0)
         }
         WM_TIMER => {
@@ -1187,6 +1892,10 @@ unsafe extern "system" fn edit_proc(
                     unsafe { delete_word_back(hwnd) };
                     return LRESULT(0);
                 }
+                // Backspace with nothing typed: back out of a sub-page.
+                VK_BACK if unsafe { GetWindowTextLengthW(hwnd) } == 0 => return nav(vk),
+                // Shift+Delete removes the selected clipboard entry.
+                VK_DELETE if shift => return nav(vk),
                 _ => {}
             }
         }
