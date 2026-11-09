@@ -1,7 +1,7 @@
 //! Launcher rendering. Everything is drawn with GDI into a back buffer and
 //! blitted in one go, so there is no flicker and no GPU/driver overhead.
 
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::{DI_NORMAL, DrawIconEx};
 
@@ -9,8 +9,8 @@ use super::draw::{
     self, DISPLAY_FACES, ICON_FACES, UI_FACES, bordered_round_rect, circle, fill, inflate, mix, round_rect, text,
     text_width,
 };
-use super::theme::{Theme, WHITE, metrics as m};
-use super::window::Launcher;
+use super::theme::{Theme, WHITE, metrics as m, rgb};
+use super::window::{ArtBitmap, Launcher, Mode, Zone};
 use crate::providers::{Icon, Row};
 
 pub struct Fonts {
@@ -26,6 +26,8 @@ pub struct Fonts {
     pub calc_glyph: HFONT,
     /// Clipboard text preview.
     pub mono: HFONT,
+    /// Typing Test words.
+    pub typing: HFONT,
 }
 
 impl Fonts {
@@ -49,13 +51,14 @@ impl Fonts {
             calc_expr: draw::font(t(19), 400, &display),
             calc_glyph: draw::font(s(12), 400, ICON_FACES),
             mono: draw::font(t(13), 400, &["Cascadia Mono", "Consolas"]),
+            typing: draw::font(t(22), 400, &["Cascadia Mono", "Consolas"]),
         }
     }
 
     pub fn destroy(&mut self) {
         draw::delete_fonts(&[
             self.search, self.title, self.small, self.header, self.glyph, self.kbd_glyph, self.letter,
-            self.calc_big, self.calc_expr, self.calc_glyph, self.mono,
+            self.calc_big, self.calc_expr, self.calc_glyph, self.mono, self.typing,
         ]);
     }
 }
@@ -64,7 +67,24 @@ pub fn paint(ui: &mut Launcher) {
     let mut ps = PAINTSTRUCT::default();
     let hdc = unsafe { BeginPaint(ui.hwnd, &mut ps) };
     let (w, h) = ui.client_size();
-    if w > 0 && h > 0 {
+    let dirty = ps.rcPaint;
+    if let Some(dc) = ui.backbuf.current(w, h).filter(|_| ui.top_h() > 0 && dirty.bottom <= ui.top_h()) {
+        // Only the top bar changed (clock, readings, the media waveform):
+        // redraw just that strip over the last frame.
+        unsafe {
+            SaveDC(dc);
+            IntersectClipRect(dc, dirty.left, dirty.top, dirty.right, dirty.bottom);
+        }
+        draw::set_corner_cap(ui.s(ui.theme.radius));
+        ui.zones.borrow_mut().retain(|(_, z)| *z != Zone::MediaChip);
+        draw_top_bar(ui, dc, w);
+        draw_frame(dc, w, h, ui.s(ui.theme.frame_w).max(ui.theme.frame_w.min(1)), ui.theme.frame);
+        unsafe {
+            let _ = RestoreDC(dc, -1);
+            let (dw, dh) = (dirty.right - dirty.left, dirty.bottom - dirty.top);
+            let _ = BitBlt(hdc, dirty.left, dirty.top, dw, dh, Some(dc), dirty.left, dirty.top, SRCCOPY);
+        }
+    } else if w > 0 && h > 0 {
         let dc = ui.backbuf.ensure(hdc, w, h);
         draw(ui, dc, w, h);
         unsafe {
@@ -79,6 +99,7 @@ pub fn paint(ui: &mut Launcher) {
 pub(crate) fn draw(ui: &Launcher, dc: HDC, w: i32, h: i32) {
     let t: &Theme = &ui.theme;
     draw::set_corner_cap(ui.s(t.radius));
+    ui.zones.borrow_mut().clear();
     fill(dc, &RECT { left: 0, top: 0, right: w, bottom: h }, t.bg);
 
     let search_h = ui.s(m::SEARCH_H);
@@ -101,7 +122,11 @@ pub(crate) fn draw(ui: &Launcher, dc: HDC, w: i32, h: i32) {
         text(dc, title, &chip, ui.fonts.header, t.kbd_text, DT_CENTER);
     }
 
-    draw_list(ui, dc);
+    match ui.mode {
+        Mode::Media => draw_media_page(ui, dc),
+        Mode::Typing => draw_typing_page(ui, dc),
+        _ => draw_list(ui, dc),
+    }
     if ui.mode == super::window::Mode::Clipboard {
         draw_clip_preview(ui, dc);
     }
@@ -183,10 +208,16 @@ fn draw_top_bar(ui: &Launcher, dc: HDC, w: i32) {
     let mut x = ui.s(14);
     let gap = ui.s(18);
     for id in &tb.items {
-        let Some((glyph, label, value, meter)) = top_item(ui, id, tb) else { continue };
         if x >= w - ui.s(14) {
             break;
         }
+        if id == "media" {
+            if ui.media_in_top_bar() {
+                x = draw_media_chip(ui, dc, x, h, w - ui.s(14)) + gap;
+            }
+            continue;
+        }
+        let Some((glyph, label, value, meter)) = top_item(ui, id, tb) else { continue };
         let rc = RECT { left: x, top: 0, right: w - ui.s(10), bottom: h };
         let gw = ui.s(14);
         text(dc, &glyph.to_string(), &RECT { right: x + gw, ..rc }, ui.fonts.kbd_glyph, t.subtext, DT_CENTER);
@@ -210,6 +241,373 @@ fn draw_top_bar(ui: &Launcher, dc: HDC, w: i32) {
         }
         x += gap;
     }
+}
+
+// ----- Now Playing ------------------------------------------------------------
+
+/// Album art scaled into `rc`, or a music-note tile without it.
+fn draw_art(ui: &Launcher, dc: HDC, rc: &RECT, art: Option<&ArtBitmap>, glyph_font: HFONT) {
+    let t = &ui.theme;
+    match art {
+        Some(a) => unsafe {
+            let mem = CreateCompatibleDC(Some(dc));
+            let old = SelectObject(mem, a.bmp.into());
+            SetStretchBltMode(dc, HALFTONE);
+            let _ = SetBrushOrgEx(dc, 0, 0, None);
+            let n = a.src.size;
+            let _ = StretchBlt(dc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, Some(mem), 0, 0, n, n, SRCCOPY);
+            SelectObject(mem, old);
+            let _ = DeleteDC(mem);
+        },
+        None => {
+            round_rect(dc, rc, ui.s(4), mix(t.bg, t.text, 0.14));
+            text(dc, "\u{E8D6}", rc, glyph_font, t.subtext, DT_CENTER);
+        }
+    }
+}
+
+/// Vertical bars of the recent output level, mirrored round the middle of
+/// `rc`, newest on the right. Paused or silent, they rest as short stubs.
+fn draw_waveform(ui: &Launcher, dc: HDC, rc: &RECT, bar: i32, gap: i32, playing: bool) {
+    let t = &ui.theme;
+    let n = ((rc.right - rc.left + gap) / (bar + gap)).max(1) as usize;
+    let levels = ui.levels.last(n);
+    let h = rc.bottom - rc.top;
+    let cy = (rc.top + rc.bottom) / 2;
+    let rest = bar.max(ui.s(2));
+    // A fixed ripple so neighbouring bars differ, like a real waveform.
+    const SHAPE: [f32; 7] = [0.72, 1.0, 0.84, 0.6, 0.93, 0.78, 0.66];
+    for (i, v) in levels.iter().enumerate() {
+        let x = rc.left + i as i32 * (bar + gap);
+        let amp = if playing { v * SHAPE[i % SHAPE.len()] } else { 0.0 };
+        let bh = ((h as f32 * amp) as i32).max(rest);
+        let fade = i as f32 / n as f32; // older bars are dimmer
+        let col = if playing { mix(t.bg, t.accent, 0.45 + 0.55 * fade) } else { mix(t.bg, t.subtext, 0.6) };
+        round_rect(dc, &RECT { left: x, top: cy - bh / 2, right: x + bar, bottom: cy - bh / 2 + bh }, bar, col);
+    }
+}
+
+/// The Now Playing chip in the top bar. Returns its right edge.
+fn draw_media_chip(ui: &Launcher, dc: HDC, x0: i32, h: i32, max_right: i32) -> i32 {
+    let t = &ui.theme;
+    let mut x = x0;
+    let Some(np) = &ui.media else {
+        let gw = ui.s(14);
+        text(dc, "\u{E8D6}", &RECT { left: x, top: 0, right: x + gw, bottom: h }, ui.fonts.kbd_glyph, t.subtext, DT_CENTER);
+        x += gw + ui.s(6);
+        let label = "Nothing playing";
+        let tw = text_width(dc, label, ui.fonts.small);
+        text(dc, label, &RECT { left: x, top: 0, right: max_right, bottom: h }, ui.fonts.small, t.subtext, DT_LEFT);
+        let right = (x + tw).min(max_right);
+        ui.zones.borrow_mut().push((RECT { left: x0 - ui.s(6), top: 0, right: right + ui.s(6), bottom: h }, Zone::MediaChip));
+        return right;
+    };
+    let a = ui.s(18);
+    let art = RECT { left: x, top: (h - a) / 2, right: x + a, bottom: (h - a) / 2 + a };
+    draw_art(ui, dc, &art, ui.art.as_ref(), ui.fonts.kbd_glyph);
+    x = art.right + ui.s(8);
+    let (bar, gap) = (ui.s(2), ui.s(2));
+    let wave = RECT { left: x, top: (h - ui.s(14)) / 2, right: x + 9 * (bar + gap) - gap, bottom: (h - ui.s(14)) / 2 + ui.s(14) };
+    draw_waveform(ui, dc, &wave, bar, gap, np.playing);
+    x = wave.right + ui.s(8);
+    let line = np.line();
+    let tw = text_width(dc, &line, ui.fonts.small).min(ui.s(210)).min(max_right - x);
+    text(dc, &line, &RECT { left: x, top: 0, right: x + tw, bottom: h }, ui.fonts.small, if np.playing { t.text } else { t.subtext }, DT_LEFT | DT_END_ELLIPSIS);
+    let right = x + tw;
+    ui.zones.borrow_mut().push((RECT { left: x0 - ui.s(6), top: 0, right: right + ui.s(6), bottom: h }, Zone::MediaChip));
+    right
+}
+
+/// A round transport button; `primary` is the filled play/pause one.
+fn media_button(ui: &Launcher, dc: HDC, cx: i32, cy: i32, d: i32, glyph: &str, primary: bool, zone: Zone) -> i32 {
+    let t = &ui.theme;
+    let rc = RECT { left: cx - d / 2, top: cy - d / 2, right: cx - d / 2 + d, bottom: cy - d / 2 + d };
+    if primary {
+        circle(dc, cx, cy, d, t.accent);
+        text(dc, glyph, &rc, ui.fonts.glyph, WHITE, DT_CENTER);
+    } else {
+        circle(dc, cx, cy, d, t.kbd_bg);
+        text(dc, glyph, &rc, ui.fonts.kbd_glyph, t.text, DT_CENTER);
+    }
+    ui.zones.borrow_mut().push((rc, zone));
+    rc.right
+}
+
+/// The Now Playing page: art, track, waveform, progress and controls.
+fn draw_media_page(ui: &Launcher, dc: HDC) {
+    let t = &ui.theme;
+    let lr = ui.list_rect();
+    let card = RECT { left: lr.left + ui.s(16), top: lr.top + ui.s(16), right: lr.right - ui.s(16), bottom: lr.bottom - ui.s(16) };
+    let Some(np) = &ui.media else {
+        let mid = (lr.top + lr.bottom) / 2;
+        text(dc, "\u{E8D6}", &RECT { top: mid - ui.s(56), bottom: mid - ui.s(16), ..lr }, ui.fonts.calc_glyph, t.subtext, DT_CENTER);
+        let msg = if ui.config_module_on("media") { "Nothing is playing" } else { "Now Playing is turned off in Settings › Modules" };
+        text(dc, msg, &RECT { top: mid - ui.s(12), bottom: mid + ui.s(14), ..lr }, ui.fonts.title, t.text, DT_CENTER);
+        let sub = "Play something in Spotify, a browser, or any app that shows in Windows' media controls";
+        text(dc, sub, &RECT { left: lr.left + ui.s(24), right: lr.right - ui.s(24), top: mid + ui.s(14), bottom: mid + ui.s(38), ..lr }, ui.fonts.small, t.subtext, DT_CENTER | DT_END_ELLIPSIS);
+        return;
+    };
+    let tint = ui.art.as_ref().map_or(t.selection, |a| a.avg);
+    let fill_c = mix(t.bg, tint, if t.dark { 0.22 } else { 0.14 });
+    draw::bordered_round_rect(dc, &card, ui.s(10), 1, fill_c, mix(fill_c, t.text, 0.08));
+
+    let pad = ui.s(22);
+    let art_sz = (card.bottom - card.top - 2 * pad).min(ui.s(176));
+    let at = card.top + (card.bottom - card.top - art_sz) / 2;
+    let art = RECT { left: card.left + pad, top: at, right: card.left + pad + art_sz, bottom: at + art_sz };
+    draw_art(ui, dc, &art, ui.art.as_ref(), ui.fonts.calc_glyph);
+
+    let tx = art.right + ui.s(26);
+    let tr = card.right - pad;
+    let row = |top: i32, hgt: i32| RECT { left: tx, top: art.top + top, right: tr, bottom: art.top + top + hgt };
+    let title = if np.title.is_empty() { "Unknown track" } else { &np.title };
+    text(dc, title, &row(0, ui.s(30)), ui.fonts.calc_expr, t.text, DT_LEFT | DT_END_ELLIPSIS);
+    let by = match (np.artist.is_empty(), np.album.is_empty()) {
+        (false, false) => format!("{} · {}", np.artist, np.album),
+        (false, true) => np.artist.clone(),
+        (true, false) => np.album.clone(),
+        _ => String::new(),
+    };
+    text(dc, &by, &row(ui.s(31), ui.s(22)), ui.fonts.title, t.subtext, DT_LEFT | DT_END_ELLIPSIS);
+    let app = ui.media_app_name();
+    let state = if np.playing { format!("Playing on {app}") } else { format!("Paused · {app}") };
+    text(dc, &state, &row(ui.s(54), ui.s(20)), ui.fonts.small, mix(t.subtext, fill_c, 0.2), DT_LEFT | DT_END_ELLIPSIS);
+
+    // Waveform across the text column.
+    draw_waveform(ui, dc, &row(ui.s(82), ui.s(24)), ui.s(3), ui.s(3), np.playing);
+
+    // Progress: elapsed · bar · length (click to seek).
+    let py = art.top + ui.s(120);
+    if let (Some(pos), Some(len)) = (np.position_now(), np.duration_ms) {
+        let tw = ui.s(46);
+        text(dc, &crate::media::clock(pos), &RECT { left: tx, top: py - ui.s(10), right: tx + tw, bottom: py + ui.s(10) }, ui.fonts.small, t.subtext, DT_LEFT);
+        text(dc, &crate::media::clock(len), &RECT { left: tr - tw, top: py - ui.s(10), right: tr, bottom: py + ui.s(10) }, ui.fonts.small, t.subtext, DT_RIGHT);
+        let bar = RECT { left: tx + tw, top: py - ui.s(2), right: tr - tw, bottom: py + ui.s(2) };
+        round_rect(dc, &bar, ui.s(2), mix(fill_c, t.text, 0.16));
+        let f = if len > 0 { pos as f32 / len as f32 } else { 0.0 };
+        let fx = bar.left + ((bar.right - bar.left) as f32 * f.clamp(0.0, 1.0)) as i32;
+        round_rect(dc, &RECT { right: fx.max(bar.left + ui.s(2)), ..bar }, ui.s(2), t.accent);
+        circle(dc, fx, py, ui.s(10), t.accent);
+        ui.zones.borrow_mut().push((RECT { top: py - ui.s(9), bottom: py + ui.s(9), ..bar }, Zone::MediaSeek));
+    }
+
+    // Controls.
+    let cy = art.bottom - ui.s(19);
+    let mut x = tx + ui.s(16);
+    x = media_button(ui, dc, x, cy, ui.s(32), "\u{E892}", false, Zone::MediaPrev);
+    let play = if np.playing { "\u{E769}" } else { "\u{E768}" };
+    x = media_button(ui, dc, x + ui.s(12) + ui.s(19), cy, ui.s(38), play, true, Zone::MediaPlay);
+    media_button(ui, dc, x + ui.s(12) + ui.s(16), cy, ui.s(32), "\u{E893}", false, Zone::MediaNext);
+    if !app.is_empty() {
+        let label = format!("Open {app}");
+        let bw = text_width(dc, &label, ui.fonts.small) + ui.s(24);
+        let b = RECT { left: tr - bw, top: cy - ui.s(15), right: tr, bottom: cy + ui.s(15) };
+        round_rect(dc, &b, ui.s(6), t.kbd_bg);
+        text(dc, &label, &b, ui.fonts.small, t.text, DT_CENTER | DT_END_ELLIPSIS);
+        ui.zones.borrow_mut().push((b, Zone::MediaApp));
+    }
+}
+
+// ----- Typing Test --------------------------------------------------------------
+
+fn typing_error_color(t: &Theme) -> COLORREF {
+    if t.dark { rgb(242, 104, 104) } else { rgb(200, 40, 40) }
+}
+
+fn kind_label(k: crate::typing::Kind) -> String {
+    match k {
+        crate::typing::Kind::Time(s) => format!("{s} seconds"),
+        crate::typing::Kind::Words(n) => format!("{n} words"),
+    }
+}
+
+/// The Typing Test page: just the words (with a length menu above them
+/// until you start), then a short result.
+fn draw_typing_page(ui: &Launcher, dc: HDC) {
+    use crate::typing::Kind;
+    let t = &ui.theme;
+    let lr = ui.list_rect();
+    let Some(test) = &ui.typing else { return };
+    if let Some(score) = test.finished {
+        draw_typing_results(ui, dc, &lr, &score);
+        return;
+    }
+    let left = lr.left + ui.s(40);
+    let right = lr.right - ui.s(40);
+    let block = 3 * ui.s(42);
+    let top = lr.top + (lr.bottom - lr.top - block) / 2;
+    let hy = top - ui.s(46);
+    if test.running() {
+        // Time left (or words done), quietly above the words.
+        let s = match test.kind {
+            Kind::Time(_) => test.remaining().unwrap_or(0).to_string(),
+            Kind::Words(n) => format!("{}/{n}", test.current),
+        };
+        text(dc, &s, &RECT { left, top: hy, right, bottom: hy + ui.s(32) }, ui.fonts.calc_expr, t.accent, DT_LEFT);
+    } else {
+        // The length menu.
+        let label = kind_label(test.kind);
+        let lw = text_width(dc, &label, ui.fonts.title);
+        let pill = RECT { left: left - ui.s(10), top: hy, right: left + lw + ui.s(32), bottom: hy + ui.s(30) };
+        round_rect(dc, &pill, ui.s(6), t.kbd_bg);
+        text(dc, &label, &RECT { left: pill.left + ui.s(10), ..pill }, ui.fonts.title, t.text, DT_LEFT);
+        text(dc, "\u{E70D}", &RECT { left: pill.right - ui.s(24), right: pill.right - ui.s(6), ..pill }, ui.fonts.kbd_glyph, t.subtext, DT_CENTER);
+        ui.zones.borrow_mut().push((pill, Zone::TypingMenu));
+        if let Some(b) = ui.typing_store.as_ref().and_then(|st| st.best(test.kind)) {
+            text(dc, &format!("Best {:.0} wpm", b.wpm), &RECT { left: pill.right, top: hy, right, bottom: hy + ui.s(30) }, ui.fonts.small, t.subtext, DT_RIGHT);
+        }
+    }
+    draw_typing_words(ui, dc, test, top, left, right);
+    // Before starting: does this run feed the Solar System?
+    if let (false, Some((wait, at))) = (test.running(), ui.harvest_wait) {
+        let wait = wait.saturating_sub(at.elapsed().as_secs());
+        let (msg, col) = if wait == 0 {
+            ("This run feeds your solar system: every word typed right becomes material".to_string(), t.accent)
+        } else {
+            (format!("Practice run · the next one that feeds your solar system is in {}", super::solar::wait_label(wait)), t.subtext)
+        };
+        let y = top + block + ui.s(16);
+        text(dc, &msg, &RECT { left, top: y, right, bottom: y + ui.s(22) }, ui.fonts.small, col, DT_LEFT | DT_END_ELLIPSIS);
+    }
+}
+
+/// Three lines of words; the line being typed is kept first or second.
+fn draw_typing_words(ui: &Launcher, dc: HDC, test: &crate::typing::Test, top: i32, left: i32, right: i32) {
+    let t = &ui.theme;
+    let font = ui.fonts.typing;
+    let cw = text_width(dc, "m", font).max(1);
+    let line_h = ui.s(42);
+    let cap = ((right - left) / cw).max(10) as usize;
+    let err = typing_error_color(t);
+
+    // Lay out words into lines: (first word, end) by display length.
+    let shown_len = |i: usize| test.words[i].chars().count().max(test.typed.get(i).map_or(0, |s| s.chars().count()));
+    let mut lines: Vec<(usize, usize)> = Vec::new();
+    let (mut start, mut len) = (0usize, 0usize);
+    let limit = test.words.len().min(test.current + 80);
+    for i in 0..limit {
+        let l = shown_len(i);
+        if len > 0 && len + 1 + l > cap {
+            lines.push((start, i));
+            start = i;
+            len = 0;
+        }
+        len += if len > 0 { 1 } else { 0 } + l;
+    }
+    lines.push((start, limit));
+    let cur_line = lines.iter().position(|&(a, b)| test.current >= a && test.current < b).unwrap_or(0);
+    let first = cur_line.saturating_sub(1);
+
+    let mut placed = ui.typing_words.borrow_mut();
+    placed.clear();
+    for (li, &(a, b)) in lines.iter().enumerate().skip(first).take(3) {
+        let ly = top + (li - first) as i32 * line_h;
+        let mut x = left;
+        for i in a..b {
+            placed.push((i, x, ly, line_h));
+            let word: Vec<char> = test.words[i].chars().collect();
+            let typed: Vec<char> = test.typed.get(i).map(|s| s.chars().collect()).unwrap_or_default();
+            let past = i < test.current;
+            let word_x = x;
+            for j in 0..word.len().max(typed.len()) {
+                let (c, col) = match (word.get(j), typed.get(j)) {
+                    (Some(w), Some(ty)) if w == ty => (*w, t.text),
+                    (Some(w), Some(_)) => (*w, err),
+                    (Some(w), None) => (*w, if past { mix(err, t.bg, 0.45) } else { t.subtext }),
+                    (None, Some(ty)) => (*ty, mix(err, t.bg, 0.3)),
+                    (None, None) => break,
+                };
+                let rc = RECT { left: x, top: ly, right: x + cw * 2, bottom: ly + line_h };
+                text(dc, &c.to_string(), &rc, font, col, DT_LEFT);
+                x += cw;
+            }
+            if past && typed != word {
+                let uy = ly + line_h - ui.s(9);
+                fill(dc, &RECT { left: word_x, top: uy, right: x, bottom: uy + ui.s(2) }, mix(err, t.bg, 0.25));
+            }
+            if i == test.current {
+                let cx = word_x + typed.len() as i32 * cw - ui.s(1);
+                let ch = line_h * 3 / 5;
+                fill(dc, &RECT { left: cx, top: ly + (line_h - ch) / 2, right: cx + ui.s(2), bottom: ly + (line_h + ch) / 2 }, t.accent);
+            }
+            x += cw; // the space
+        }
+    }
+}
+
+/// The result, centred: speed, accuracy, best, and what was harvested.
+fn draw_typing_results(ui: &Launcher, dc: HDC, lr: &RECT, s: &crate::typing::Score) {
+    let t = &ui.theme;
+    let cx = (lr.left + lr.right) / 2;
+    let row = |y: i32, h: i32| RECT { left: lr.left + ui.s(24), top: y, right: lr.right - ui.s(24), bottom: y + h };
+    let top = (lr.top + lr.bottom) / 2 - ui.s(96);
+
+    // "74 wpm"
+    let num = format!("{:.0}", s.wpm);
+    let nw = text_width(dc, &num, ui.fonts.calc_big);
+    let unit = " wpm";
+    let uw = text_width(dc, unit, ui.fonts.title);
+    let x0 = cx - (nw + uw) / 2;
+    text(dc, &num, &RECT { left: x0, top, right: x0 + nw + 2, bottom: top + ui.s(52) }, ui.fonts.calc_big, t.accent, DT_LEFT);
+    text(dc, unit, &RECT { left: x0 + nw, top: top + ui.s(10), right: x0 + nw + uw + 2, bottom: top + ui.s(52) }, ui.fonts.title, t.subtext, DT_LEFT);
+
+    let line = format!("{:.0}% accuracy · {:.0} raw · {:.0} s", s.acc, s.raw, s.secs);
+    text(dc, &line, &row(top + ui.s(58), ui.s(24)), ui.fonts.title, t.text, DT_CENTER);
+
+    let best = ui.typing.as_ref().and_then(|tt| ui.typing_store.as_ref().and_then(|st| st.best(tt.kind)));
+    let (msg, col) = if ui.typing_new_best {
+        ("New personal best!".to_string(), t.accent)
+    } else if s.acc < 75.0 {
+        ("Under 75% accuracy, so it doesn't count towards your best".to_string(), t.subtext)
+    } else {
+        (best.map_or(String::new(), |b| format!("Your best is {:.0} wpm", b.wpm)), t.subtext)
+    };
+    text(dc, &msg, &row(top + ui.s(86), ui.s(22)), ui.fonts.small, col, DT_CENTER | DT_END_ELLIPSIS);
+
+    // What the Solar System got.
+    let hy = top + ui.s(124);
+    match ui.harvest {
+        Some(Ok(got)) if got.iter().sum::<u32>() > 0 => {
+            let n: u32 = got.iter().sum();
+            let head = format!("+{n} particles for your solar system");
+            let parts: Vec<(crate::solar::Material, String)> = crate::solar::Material::ALL
+                .iter()
+                .filter(|m| got[m.index()] > 0)
+                .map(|m| (*m, format!("{} {}", got[m.index()], m.name().to_lowercase())))
+                .collect();
+            let sw = ui.s(9);
+            let gap = ui.s(14);
+            let total = text_width(dc, &head, ui.fonts.title)
+                + parts.iter().map(|(_, l)| gap + sw + ui.s(5) + text_width(dc, l, ui.fonts.small)).sum::<i32>();
+            let mut x = cx - total / 2;
+            let hw = text_width(dc, &head, ui.fonts.title);
+            text(dc, &head, &RECT { left: x, top: hy, right: x + hw + 2, bottom: hy + ui.s(24) }, ui.fonts.title, t.accent, DT_LEFT);
+            x += hw;
+            for (m, label) in parts {
+                x += gap;
+                let my = hy + ui.s(12);
+                fill(dc, &RECT { left: x, top: my - sw / 2, right: x + sw, bottom: my + sw / 2 }, material_color(m));
+                x += sw + ui.s(5);
+                let lw = text_width(dc, &label, ui.fonts.small);
+                text(dc, &label, &RECT { left: x, top: hy, right: x + lw + 2, bottom: hy + ui.s(24) }, ui.fonts.small, t.subtext, DT_LEFT);
+                x += lw;
+            }
+        }
+        Some(Ok(_)) => {
+            text(dc, "No words typed right, so nothing to harvest", &row(hy, ui.s(24)), ui.fonts.small, t.subtext, DT_CENTER);
+        }
+        Some(Err(wait)) => {
+            let msg = format!("Practice run · next harvest in {}", super::solar::wait_label(wait));
+            text(dc, &msg, &row(hy, ui.s(24)), ui.fonts.small, t.subtext, DT_CENTER);
+        }
+        None => {}
+    }
+    text(dc, "Tab or Enter to go again", &row(hy + ui.s(44), ui.s(22)), ui.fonts.small, t.subtext, DT_CENTER);
+}
+
+fn material_color(m: crate::solar::Material) -> COLORREF {
+    let c = m.rgb();
+    COLORREF((c >> 16) & 0xFF | (c & 0xFF00) | (c & 0xFF) << 16)
 }
 
 fn ago_long(then: u64) -> String {
@@ -423,6 +821,10 @@ fn draw_list(ui: &Launcher, dc: HDC) {
                         fill(dc, &irc, t.divider);
                         fill(dc, &draw::inset(&irc, 1), windows::Win32::Foundation::COLORREF(*c));
                     }
+                    Icon::Char(c) => {
+                        round_rect(dc, &irc, ui.s(6), t.accent);
+                        text(dc, &c.to_string(), &irc, ui.fonts.title, WHITE, DT_CENTER);
+                    }
                 }
 
                 // Accessory (right) then title/subtitle (left, truncated).
@@ -579,6 +981,14 @@ fn draw_footer(ui: &Launcher, dc: HDC, w: i32, h: i32) {
         }
         None if ui.mode == super::window::Mode::Clipboard => {
             text(dc, "Delete: Shift+Del · Back: Esc", &left_rc, ui.fonts.small, t.subtext, DT_LEFT | DT_END_ELLIPSIS)
+        }
+        None if ui.mode == Mode::Media => {
+            let msg = "Play/Pause: Space · Skip: ← → · Back: Esc";
+            text(dc, msg, &RECT { right: w - ui.s(14), ..left_rc }, ui.fonts.small, t.subtext, DT_LEFT | DT_END_ELLIPSIS)
+        }
+        None if ui.mode == Mode::Typing => {
+            let msg = "Restart: Tab · Back: Esc";
+            text(dc, msg, &RECT { right: w - ui.s(14), ..left_rc }, ui.fonts.small, t.subtext, DT_LEFT | DT_END_ELLIPSIS)
         }
         None if ui.mode != super::window::Mode::Root => {
             text(dc, "Back: Esc", &left_rc, ui.fonts.small, t.subtext, DT_LEFT | DT_END_ELLIPSIS)

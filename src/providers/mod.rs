@@ -57,6 +57,30 @@ pub const MODULES: &[ModuleInfo] = &[
         glyph: '\u{E9D9}',
     },
     ModuleInfo {
+        id: "media",
+        name: "Now Playing",
+        description: "Spotify (or any player in Windows' media controls) in the top bar, with play, pause and skip",
+        glyph: '\u{E8D6}',
+    },
+    ModuleInfo {
+        id: "typing",
+        name: "Typing Test",
+        description: "Timed and word-count typing tests with WPM, accuracy and personal bests",
+        glyph: '\u{E765}',
+    },
+    ModuleInfo {
+        id: "solar",
+        name: "Solar System",
+        description: "Typing tests harvest material (one test an hour) to build planets around your own star",
+        glyph: '\u{E706}',
+    },
+    ModuleInfo {
+        id: "greek",
+        name: "Greek Letters",
+        description: "A hotkey that turns the letter you just typed Greek, SMath style (set it under Keyboard)",
+        glyph: '\u{E8D2}',
+    },
+    ModuleInfo {
         id: "winget",
         name: "WinGet",
         description: "Search, install, upgrade and remove packages",
@@ -85,6 +109,8 @@ pub enum Icon {
     Glyph(char),
     /// A square colour swatch (COLORREF).
     Swatch(u32),
+    /// A character (e.g. a Greek letter) drawn on an accent tile.
+    Char(char),
 }
 
 /// Built-in commands handled by the launcher itself.
@@ -108,6 +134,13 @@ pub enum Command {
     ColorHistory,
     ClearColors,
     SuggestFeature,
+    NowPlaying,
+    MediaPlayPause,
+    MediaNext,
+    MediaPrevious,
+    TypingTest,
+    GreekLetters,
+    SolarSystem,
 }
 
 /// What Enter does on a WinGet package.
@@ -139,6 +172,8 @@ pub enum Action {
     CopyText(String),
     /// Send a feature suggestion (opens a prefilled GitHub issue).
     Suggest(String),
+    /// A Greek letter: Enter copies the small letter, Shift+Enter the capital.
+    Greek { lower: char, upper: char },
 }
 
 impl Action {
@@ -158,6 +193,7 @@ impl Action {
             Action::Color(_) => "Copy HEX",
             Action::CopyText(_) => "Copy",
             Action::Suggest(_) => "Send Suggestion",
+            Action::Greek { .. } => "Copy",
         }
     }
 }
@@ -218,6 +254,10 @@ pub struct Registry {
     pub clipboard: commands::CommandsProvider,
     pub files: commands::CommandsProvider,
     pub colors: commands::CommandsProvider,
+    pub media: commands::CommandsProvider,
+    pub typing: commands::CommandsProvider,
+    pub greek: commands::CommandsProvider,
+    pub solar: commands::CommandsProvider,
     /// Module ids turned off in settings.
     pub disabled: Vec<String>,
 }
@@ -231,12 +271,19 @@ impl Registry {
             clipboard: commands::CLIPBOARD,
             files: commands::FILES,
             colors: commands::COLORS,
+            media: commands::MEDIA,
+            typing: commands::TYPING,
+            greek: commands::GREEK,
+            solar: commands::SOLAR,
             disabled: Vec::new(),
         }
     }
 
     fn enabled(&self) -> Vec<&dyn Provider> {
-        let all: [&dyn Provider; 6] = [&self.apps, &self.files, &self.colors, &self.clipboard, &self.winget, &self.commands];
+        let all: [&dyn Provider; 10] = [
+            &self.apps, &self.files, &self.colors, &self.clipboard, &self.media, &self.typing, &self.solar, &self.greek,
+            &self.winget, &self.commands,
+        ];
         all.into_iter().filter(|p| !self.disabled.iter().any(|d| d == p.id())).collect()
     }
 

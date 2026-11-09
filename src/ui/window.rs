@@ -5,7 +5,7 @@
 //! the state is not borrowed, or the resulting messages are handled by posting
 //! a follow-up message instead of touching the state.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -15,7 +15,7 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, CreateSolidBrush, DeleteObject, GetDC, HGDIOBJ, MonitorFromWindow, GetMonitorInfoW, GetTextMetricsW, HBRUSH, HDC, HFONT,
+    ClientToScreen, CreateSolidBrush, DeleteObject, GetDC, HBITMAP, HGDIOBJ, MonitorFromWindow, GetMonitorInfoW, GetTextMetricsW, HBRUSH, HDC, HFONT,
     InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, ReleaseDC, SelectObject,
     SetBkColor, SetTextColor, TEXTMETRICW,
 };
@@ -25,8 +25,8 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_NEXT, VK_PRIOR,
-    VK_DELETE, VK_RETURN, VK_SHIFT, VK_TAB, VK_UP,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME,
+    VK_LEFT, VK_NEXT, VK_PRIOR, VK_DELETE, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -40,6 +40,7 @@ use super::input;
 use super::{
     WM_APP_APP_PICKED, WM_APP_CHECK_UPDATE, WM_APP_CLEAR_HISTORY, WM_APP_CONFIG_CHANGED, WM_APP_DRAG_BEGIN,
     WM_APP_COLOR_PICKED, WM_APP_DRAG_END, WM_APP_SYSINFO, WM_APP_FIDGET_CHAR, WM_APP_FIDGET_FRAME, WM_APP_FILES, WM_APP_PICK_APP, WM_APP_UPDATE, WM_APP_WINGET, WM_APP_WINKEY,
+    WM_APP_MEDIA, WM_APP_OPEN_SOLAR, WM_APP_OPEN_TYPING, WM_APP_TYPE_CHAR, WM_APP_TYPING_MENU,
 };
 use super::fidget::{Fidget, Pacer, Shake};
 use super::theme::{self, Theme, metrics as m};
@@ -101,6 +102,15 @@ const STATUS_TIMER: usize = 8;
 /// Redraws the top bar's clock once a second while the launcher is open.
 const CLOCK_TIMER: usize = 12;
 const EDIT_ID: usize = 100;
+/// Waveform and progress frames (~30 fps) while something is playing on screen.
+const MEDIA_TIMER: usize = 14;
+const MEDIA_FRAME_MS: u32 = 33;
+/// Countdown and time-up check while a typing test runs.
+const TYPING_TIMER: usize = 15;
+/// Harvested words flying off across the screen.
+const FLY_TIMER: usize = 16;
+/// Moves the Solar System's star round the launcher (~30 fps).
+const STAR_TIMER: usize = 17;
 /// Typed letters start again from the left after this long without typing.
 const FIDGET_CARET_RESET: Duration = Duration::from_millis(1500);
 const FIDGET_STATUS: &str = "Fidget mode: type to make pixels · Enter to scatter · Esc to stop";
@@ -118,9 +128,96 @@ thread_local! {
     /// launcher instead of inserting them.
     static FIDGET_ON: Cell<bool> = const { Cell::new(false) };
 
+    /// Pages that take keys from the search box: see [`PageKeys`].
+    static PAGE_KEYS: Cell<PageKeys> = const { Cell::new(PageKeys::None) };
+
     /// Search box colours, read during WM_CTLCOLOREDIT without touching state.
     static EDIT_STYLE: Cell<(HBRUSH, COLORREF, COLORREF)> =
         const { Cell::new((HBRUSH(std::ptr::null_mut()), COLORREF(0), COLORREF(0))) };
+}
+
+/// How the search box treats keys on the current page.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PageKeys {
+    None,
+    /// Now Playing: Space, Left and Right control playback; typing is ignored.
+    Media,
+    /// Typing Test: every character goes to the test.
+    Typing,
+}
+
+/// Clickable parts of custom-drawn pages and the top bar (rebuilt on paint).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Zone {
+    MediaChip,
+    MediaPrev,
+    MediaPlay,
+    MediaNext,
+    MediaSeek,
+    MediaApp,
+    TypingMenu,
+}
+
+/// A harvested typing test: the words break into pixels on a screen-wide
+/// layer and fly off the sides of the screen (or into the Solar System's
+/// toolbar when it's open).
+pub struct FlyFx {
+    pub ov: super::fidget::Overlay,
+    pub start: Instant,
+    /// In layer pixels: (x, y, target x, target y, colour or 0 for a mistyped word, delay s, seed).
+    pub parts: Vec<(f32, f32, f32, f32, u32, f32, u32)>,
+}
+
+/// How long the fly-off runs.
+pub const FLY_SECS: f32 = 1.8;
+
+/// Album art as a GDI bitmap, made once per track.
+pub struct ArtBitmap {
+    pub src: std::sync::Arc<crate::media::Art>,
+    pub bmp: HBITMAP,
+    /// Average colour, to tint the Now Playing card.
+    pub avg: COLORREF,
+}
+
+impl ArtBitmap {
+    fn new(src: std::sync::Arc<crate::media::Art>) -> Option<Self> {
+        use windows::Win32::Graphics::Gdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS};
+        let n = src.size;
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: n,
+                biHeight: -n,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let bmp = unsafe { CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0) }.ok()?;
+        if bits.is_null() {
+            unsafe {
+                let _ = DeleteObject(bmp.into());
+            }
+            return None;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(src.px.as_ptr(), bits as *mut u32, src.px.len()) };
+        let n = src.px.len().max(1) as u64;
+        let sum = |shift: u32| src.px.iter().map(|p| ((p >> shift) & 0xFF) as u64).sum::<u64>() / n;
+        // Pixels are BGRX; COLORREF is 0x00BBGGRR.
+        let avg = COLORREF((sum(16) | sum(8) << 8 | sum(0) << 16) as u32);
+        Some(Self { src, bmp, avg })
+    }
+}
+
+impl Drop for ArtBitmap {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteObject(self.bmp.into());
+        }
+    }
 }
 
 pub struct Launcher {
@@ -205,6 +302,28 @@ pub struct Launcher {
     pub pulse_row: Option<usize>,
     /// Where the next typed letter appears (search box x) and when the last one was typed.
     fidget_caret: (i32, Option<Instant>),
+    /// Clickable areas drawn by the last paint.
+    pub zones: RefCell<Vec<(RECT, Zone)>>,
+    /// Now playing (from the media worker), its art, and the output level meter.
+    pub media: Option<crate::media::NowPlaying>,
+    pub art: Option<ArtBitmap>,
+    media_worker: Option<crate::media::Media>,
+    meter: Option<crate::media::Meter>,
+    pub levels: crate::media::Levels,
+    /// The typing test on screen, its saved bests, and whether the last run was a best.
+    pub typing: Option<Box<crate::typing::Test>>,
+    pub typing_store: Option<crate::typing::Store>,
+    pub typing_new_best: bool,
+    /// Where the visible words were last drawn: (word index, x, line top, line height).
+    pub typing_words: RefCell<Vec<(usize, i32, i32, i32)>>,
+    /// Solar System harvest of the last finished test: particles gained, or seconds to wait.
+    pub harvest: Option<Result<[u32; crate::solar::N], u64>>,
+    pub fly: Option<FlyFx>,
+    /// The star circling the launcher, and the clock for its lap.
+    star: Option<super::solar::StarBadge>,
+    star_t0: Instant,
+    /// Seconds until the next harvest, as of when it was read.
+    pub harvest_wait: Option<(u64, Instant)>,
 }
 
 /// Posted by update worker threads.
@@ -229,6 +348,9 @@ pub enum Mode {
     Files,
     Colors,
     Suggest,
+    Media,
+    Typing,
+    Greek,
 }
 
 impl Mode {
@@ -242,6 +364,9 @@ impl Mode {
             Mode::Files => "Files",
             Mode::Colors => "Colours",
             Mode::Suggest => "Suggest a Feature",
+            Mode::Media => "Now Playing",
+            Mode::Typing => "Typing Test",
+            Mode::Greek => "Greek Letters",
         }
     }
 
@@ -254,6 +379,17 @@ impl Mode {
             Mode::Files => "Search files and folders…",
             Mode::Colors => "Search picked colours…",
             Mode::Suggest => "Describe a feature you'd like…",
+            Mode::Media => "What's playing on this PC",
+            Mode::Typing => "Start typing; the clock starts with your first key",
+            Mode::Greek => "Search Greek letters…",
+        }
+    }
+
+    fn page_keys(self) -> PageKeys {
+        match self {
+            Mode::Media => PageKeys::Media,
+            Mode::Typing => PageKeys::Typing,
+            _ => PageKeys::None,
         }
     }
 }
@@ -364,6 +500,7 @@ impl Launcher {
             Action::Clip(_) => Some("Copy"),
             Action::OpenFile { .. } => Some("Show in Folder"),
             Action::Color(_) => Some("Copy RGB"),
+            Action::Greek { .. } => Some("Copy Capital"),
             Action::Update => Some("Release Notes"),
             Action::Winget { op: crate::providers::WingetOp::Manage { has_update: true } | crate::providers::WingetOp::Upgrade, .. } => {
                 Some("Uninstall")
@@ -583,6 +720,21 @@ impl Launcher {
             colors: crate::colors::History::load(),
             pulse_row: None,
             fidget_caret: (0, None),
+            zones: RefCell::new(Vec::new()),
+            media: None,
+            art: None,
+            media_worker: None,
+            meter: None,
+            levels: Default::default(),
+            typing: None,
+            typing_store: None,
+            typing_new_best: false,
+            typing_words: RefCell::new(Vec::new()),
+            harvest: None,
+            fly: None,
+            star: None,
+            star_t0: Instant::now(),
+            harvest_wait: None,
         });
         me.create_edit();
         me.apply_dpi(dpi, false);
@@ -817,6 +969,20 @@ impl Launcher {
         }
         self.files_folders = cfg.file_folders.clone();
         self.update_sampler();
+        if !self.star_wanted() {
+            self.star = None;
+        }
+        // Now Playing: the worker exists only while the module is on.
+        if !cfg.module_enabled("media") {
+            self.media_worker = None;
+            self.media = None;
+            self.art = None;
+            self.meter = None;
+        } else if self.media_worker.is_none() && !super::headless() {
+            let w = crate::media::Media::start(self.hwnd, WM_APP_MEDIA);
+            w.set_active(self.visible);
+            self.media_worker = Some(w);
+        }
         if !first && self.visible {
             // The top bar may have appeared or gone: resize and re-lay out.
             let (w, h) = self.window_size();
@@ -872,8 +1038,19 @@ impl Launcher {
                 self.set_status(e, true, None);
             }
         }
+        // The Greek hotkey lives in the keyboard hook (it needs to see the letter typed before it).
+        let mut greek = None;
+        if cfg.module_enabled("greek") && !cfg.greek_hotkey.trim().is_empty() {
+            match hotkey::parse(&cfg.greek_hotkey) {
+                Ok(k) => greek = Some(k),
+                Err(e) => self.set_status(format!("Greek hotkey: {e}"), true, None),
+            }
+        }
         // The keyboard hook: remaps, Windows key, and hotkeys taken over above.
-        input::configure(self.hwnd, input::Rules { win_tap: cfg.windows_key, remaps: cfg.key_rules(), hotkeys: self.taken.clone() });
+        input::configure(
+            self.hwnd,
+            input::Rules { win_tap: cfg.windows_key, remaps: cfg.key_rules(), hotkeys: self.taken.clone(), greek },
+        );
         if let Some(err) = self.config.error.clone() {
             self.set_status(err, true, None);
         }
@@ -936,6 +1113,9 @@ impl Launcher {
         let page = match c {
             Command::SearchFiles => Some(Mode::Files),
             Command::SuggestFeature => Some(Mode::Suggest),
+            Command::NowPlaying => Some(Mode::Media),
+            Command::TypingTest => Some(Mode::Typing),
+            Command::GreekLetters => Some(Mode::Greek),
             Command::ColorHistory => Some(Mode::Colors),
             Command::ClipboardHistory => Some(Mode::Clipboard),
             Command::WingetSearch => Some(Mode::Winget(crate::winget::Query::Search)),
@@ -1032,6 +1212,8 @@ impl Launcher {
             Mode::Files => self.rows = self.file_rows(&q),
             Mode::Colors => self.rows = self.color_rows(&q),
             Mode::Suggest => self.rows = self.suggest_rows(),
+            Mode::Media | Mode::Typing => self.rows = Vec::new(),
+            Mode::Greek => self.rows = self.greek_rows(&q),
         }
         // A typed colour (#hex, rgb(), hsl()) at the top, in every format.
         if self.mode == Mode::Root && self.pick_for.is_none() && self.config.config.module_enabled("colors") {
@@ -1049,6 +1231,14 @@ impl Launcher {
                     }));
                 }
                 self.rows.splice(0..0, rows);
+            }
+        }
+        // Greek letters by name ("theta", "omeg").
+        if self.mode == Mode::Root && self.pick_for.is_none() && self.config.config.module_enabled("greek") {
+            let hits = greek_matches(&self.query);
+            if !hits.is_empty() {
+                self.rows.push(Row::Header("Greek Letters"));
+                self.rows.extend(hits.into_iter().map(|l| Row::Item(greek_item(l))));
             }
         }
         // A few file matches under the root results.
@@ -1157,9 +1347,21 @@ impl Launcher {
             self.root_query = self.query.clone();
         }
         self.mode = mode;
+        PAGE_KEYS.with(|k| k.set(mode.page_keys()));
+        if mode.page_keys() != PageKeys::None {
+            // These pages don't type into the search box: hide its caret.
+            unsafe {
+                let _ = HideCaret(Some(self.edit));
+            }
+        }
         self.set_search_text("");
         self.set_placeholder(mode.placeholder());
         self.layout_edit();
+        match mode {
+            Mode::Typing => self.typing_restart(),
+            Mode::Media => self.media_frames(),
+            _ => {}
+        }
         if let Mode::Winget(kind) = mode {
             self.winget = WingetState::default();
             if kind != crate::winget::Query::Search {
@@ -1169,11 +1371,35 @@ impl Launcher {
         self.refresh_rows(false);
     }
 
+    /// Tidies up the page being left (timers, typed state).
+    fn leave_page(&mut self) {
+        if PAGE_KEYS.with(|k| k.replace(PageKeys::None)) != PageKeys::None {
+            unsafe {
+                let _ = ShowCaret(Some(self.edit));
+            }
+        }
+        if self.mode == Mode::Typing {
+            self.typing = None;
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TYPING_TIMER);
+            }
+        }
+        if self.mode == Mode::Media {
+            let keep = self.media_in_top_bar();
+            if !keep {
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), MEDIA_TIMER);
+                }
+            }
+        }
+    }
+
     /// Back to the root search, restoring what was typed there.
     fn go_back(&mut self) {
         if self.mode == Mode::Root {
             return;
         }
+        self.leave_page();
         self.mode = Mode::Root;
         let q = std::mem::take(&mut self.root_query);
         self.set_search_text(&q);
@@ -1683,6 +1909,7 @@ impl Launcher {
             .is_none_or(|t| t.elapsed() >= Duration::from_secs(self.config.config.keep_query_secs));
         if self.reset_on_show || expired {
             if self.mode != Mode::Root {
+                self.leave_page();
                 self.mode = Mode::Root;
                 self.root_query.clear();
                 self.set_placeholder(Mode::Root.placeholder());
@@ -1731,8 +1958,15 @@ impl Launcher {
         if let Some(s) = &self.sampler {
             s.set_active(true);
         }
+        if let Some(w) = &self.media_worker {
+            w.set_active(true);
+        }
+        self.media_frames();
         unsafe {
             SetTimer(Some(self.hwnd), CLOCK_TIMER, 1000, None);
+            if self.star_wanted() {
+                SetTimer(Some(self.hwnd), STAR_TIMER, 33, None);
+            }
         }
         if self.files_built.is_none_or(|t| t.elapsed() > REFILE_AFTER) {
             self.start_file_index();
@@ -1760,9 +1994,22 @@ impl Launcher {
         if let Some(s) = &self.sampler {
             s.set_active(false);
         }
+        if let Some(w) = &self.media_worker {
+            w.set_active(false);
+        }
+        self.meter = None;
+        self.levels.clear();
+        // A typing test doesn't carry on in the background.
+        if self.typing.as_ref().is_some_and(|t| t.running()) {
+            self.typing_restart();
+        }
         unsafe {
             let _ = KillTimer(Some(self.hwnd), CLOCK_TIMER);
+            let _ = KillTimer(Some(self.hwnd), MEDIA_TIMER);
+            let _ = KillTimer(Some(self.hwnd), TYPING_TIMER);
+            let _ = KillTimer(Some(self.hwnd), STAR_TIMER);
         }
+        self.star = None;
         if self.pick_for.take().is_some() {
             // Pick cancelled (or finished): back to normal mode next time.
             self.status = None;
@@ -1812,6 +2059,26 @@ impl Launcher {
             match vk {
                 VK_ESCAPE if !ctrl => return self.stop_fidget(),
                 VK_RETURN => return self.fidget_burst(),
+                _ => {}
+            }
+        }
+        if self.mode == Mode::Media {
+            let cmd = match vk {
+                VK_SPACE | VK_RETURN => Some(crate::media::Cmd::PlayPause),
+                VK_LEFT => Some(crate::media::Cmd::Previous),
+                VK_RIGHT => Some(crate::media::Cmd::Next),
+                _ => None,
+            };
+            if let Some(c) = cmd {
+                self.media_cmd(c);
+                return;
+            }
+        }
+        if self.mode == Mode::Typing {
+            match vk {
+                VK_TAB => return self.typing_restart(),
+                VK_RETURN if self.typing.as_ref().is_some_and(|t| t.finished.is_some()) => return self.typing_restart(),
+                VK_RETURN | VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT => return,
                 _ => {}
             }
         }
@@ -1930,6 +2197,11 @@ impl Launcher {
                 self.copy_with_pulse(&t, Some(idx));
                 return;
             }
+            Action::Greek { lower, upper } => {
+                let t = if shift { *upper } else { *lower }.to_string();
+                self.copy_with_pulse(&t, Some(idx));
+                return;
+            }
             Action::Suggest(idea) => {
                 let text = crate::util::suggestion_text(idea, &crate::install::version_label());
                 self.allow_foreground();
@@ -1986,7 +2258,14 @@ impl Launcher {
                 self.flash_then_hide(idx);
             }
             Action::Command(c) => self.run_command(c),
-            Action::Winget { .. } | Action::Clip(_) | Action::Update | Action::OpenFile { .. } | Action::Color(_) | Action::CopyText(_) | Action::Suggest(_) => {}
+            Action::Winget { .. }
+            | Action::Clip(_)
+            | Action::Update
+            | Action::OpenFile { .. }
+            | Action::Color(_)
+            | Action::CopyText(_)
+            | Action::Suggest(_)
+            | Action::Greek { .. } => {}
         }
     }
 
@@ -2041,6 +2320,18 @@ impl Launcher {
                 self.enter_mode(Mode::Files);
             }
             Command::CheckUpdates => self.start_update_check(true),
+            Command::NowPlaying => self.enter_mode(Mode::Media),
+            Command::MediaPlayPause => self.media_cmd(crate::media::Cmd::PlayPause),
+            Command::MediaNext => self.media_cmd(crate::media::Cmd::Next),
+            Command::MediaPrevious => self.media_cmd(crate::media::Cmd::Previous),
+            Command::TypingTest => self.enter_mode(Mode::Typing),
+            Command::GreekLetters => self.enter_mode(Mode::Greek),
+            Command::SolarSystem => {
+                // Open first (while we still own the foreground), then hide.
+                super::solar::open(self.hwnd, None, self.theme.accent);
+                self.reset_on_show = true;
+                self.hide();
+            }
             Command::ClearClipboard => {
                 self.clip.clear();
                 self.set_search_text("");
@@ -2066,6 +2357,434 @@ impl Launcher {
         if self.mode != Mode::Clipboard {
             self.enter_mode(Mode::Clipboard);
         }
+    }
+
+    // ----- Now Playing -------------------------------------------------------
+
+    pub fn config_module_on(&self, id: &str) -> bool {
+        self.config.config.module_enabled(id)
+    }
+
+    /// The top bar shows the Now Playing chip.
+    pub fn media_in_top_bar(&self) -> bool {
+        self.config.config.module_enabled("media") && self.top_bar().is_some_and(|tb| tb.items.iter().any(|i| i == "media"))
+    }
+
+    /// Whether Now Playing is on screen anywhere.
+    fn media_on_screen(&self) -> bool {
+        self.visible && self.config.config.module_enabled("media") && (self.mode == Mode::Media || self.media_in_top_bar())
+    }
+
+    /// Friendly name of the player ("Spotify").
+    pub fn media_app_name(&self) -> String {
+        let Some(np) = &self.media else { return String::new() };
+        if let Some(exe) = np.exe() {
+            return self.source_name(&exe);
+        }
+        if let Some(a) = self.registry.apps.find(&np.app) {
+            return a.name.clone();
+        }
+        let id = np.app.split('!').next_back().unwrap_or(&np.app);
+        let id = id.split('_').next().unwrap_or(id);
+        id.rsplit('.').next().unwrap_or(id).to_string()
+    }
+
+    fn media_cmd(&mut self, c: crate::media::Cmd) {
+        match &self.media_worker {
+            Some(w) => {
+                w.send(c);
+                // Show the change straight away; the worker confirms it shortly.
+                if let (crate::media::Cmd::PlayPause, Some(np)) = (c, &mut self.media) {
+                    np.position_ms = np.position_now();
+                    np.read_at = Instant::now();
+                    np.playing = !np.playing;
+                    self.media_frames();
+                    self.invalidate();
+                }
+            }
+            None if !self.config.config.module_enabled("media") => {
+                self.set_status("Turn on Now Playing in Settings › Modules", true, Some(Duration::from_secs(4)));
+            }
+            None => {}
+        }
+    }
+
+    fn on_media(&mut self, np: Option<crate::media::NowPlaying>) {
+        let art = np.as_ref().and_then(|n| n.art.clone());
+        match (&art, &self.art) {
+            (Some(a), Some(b)) if std::sync::Arc::ptr_eq(a, &b.src) => {}
+            (Some(a), _) => self.art = ArtBitmap::new(a.clone()),
+            (None, _) => self.art = None,
+        }
+        let exe = np.as_ref().and_then(|n| n.exe());
+        if self.meter.as_ref().is_some_and(|m| Some(&m.exe) != exe.as_ref()) {
+            self.meter = None; // the player changed: re-attach to it
+        }
+        self.media = np;
+        self.media_frames();
+        self.invalidate();
+    }
+
+    /// Starts or stops the ~30 fps waveform frames to match what's on screen.
+    fn media_frames(&mut self) {
+        let want = self.media_on_screen() && self.media.as_ref().is_some_and(|m| m.playing);
+        if want {
+            // The meter itself is opened on the first frame, off the show path.
+            unsafe {
+                SetTimer(Some(self.hwnd), MEDIA_TIMER, MEDIA_FRAME_MS, None);
+            }
+        } else {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), MEDIA_TIMER);
+            }
+            self.levels.clear();
+        }
+    }
+
+    fn on_media_frame(&mut self) {
+        if !self.media_on_screen() {
+            self.media_frames();
+            return;
+        }
+        if self.meter.is_none() && !super::headless() {
+            let exe = self.media.as_ref().and_then(|m| m.exe());
+            self.meter = crate::media::Meter::open(exe.as_deref());
+        }
+        let peak = self.meter.as_ref().map_or(0.0, |m| m.peak());
+        self.levels.push(peak);
+        if self.mode == Mode::Media {
+            self.invalidate();
+        } else if let Some((rc, _)) = self.zones.borrow().iter().find(|(_, z)| *z == Zone::MediaChip) {
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), Some(rc), false);
+            }
+        }
+    }
+
+    fn on_zone(&mut self, z: Zone, rc: RECT, x: i32) {
+        use crate::media::Cmd;
+        match z {
+            Zone::MediaChip => {
+                if self.mode != Mode::Media {
+                    if self.mode != Mode::Root {
+                        self.go_back();
+                    }
+                    self.enter_mode(Mode::Media);
+                }
+            }
+            Zone::MediaPrev => self.media_cmd(Cmd::Previous),
+            Zone::MediaPlay => self.media_cmd(Cmd::PlayPause),
+            Zone::MediaNext => self.media_cmd(Cmd::Next),
+            Zone::MediaSeek => {
+                if let Some(d) = self.media.as_ref().and_then(|m| m.duration_ms) {
+                    let f = ((x - rc.left) as f32 / (rc.right - rc.left).max(1) as f32).clamp(0.0, 1.0);
+                    let ms = (d as f32 * f) as u64;
+                    self.media_cmd(Cmd::Seek(ms));
+                    if let Some(np) = &mut self.media {
+                        np.position_ms = Some(ms);
+                        np.read_at = Instant::now();
+                    }
+                    self.invalidate();
+                }
+            }
+            Zone::MediaApp => {
+                if let Some(np) = &self.media {
+                    let (id, exe) = (np.app.clone(), np.exe());
+                    self.allow_foreground();
+                    crate::focus::focus_or_launch(&id, exe.as_deref());
+                    self.reset_on_show = true;
+                    self.hide();
+                }
+            }
+            Zone::TypingMenu => {
+                let mut pt = POINT { x: rc.left, y: rc.bottom + self.s(4) };
+                unsafe {
+                    let _ = ClientToScreen(self.hwnd, &mut pt);
+                    let lp = ((pt.y as i16 as u16 as isize) << 16) | pt.x as i16 as u16 as isize;
+                    let _ = PostMessageW(Some(self.hwnd), WM_APP_TYPING_MENU, WPARAM(0), LPARAM(lp));
+                }
+            }
+        }
+    }
+
+    fn zone_at(&self, x: i32, y: i32) -> Option<(Zone, RECT)> {
+        self.zones.borrow().iter().rev().find(|(rc, _)| super::draw::contains(rc, x, y)).map(|(rc, z)| (*z, *rc))
+    }
+
+    // ----- the Solar System's star -------------------------------------------
+
+    fn star_wanted(&self) -> bool {
+        let c = &self.config.config;
+        c.solar_star && c.module_enabled("solar") && !super::headless()
+    }
+
+    /// Moves the star a little further round the launcher and redraws it.
+    fn on_star_timer(&mut self) {
+        if !self.visible || !self.star_wanted() {
+            self.star = None;
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), STAR_TIMER);
+            }
+            return;
+        }
+        if self.star.is_none() {
+            let cell = ((2.0 * self.dpi as f32 / 96.0).round() as i32).max(2);
+            self.star = super::solar::StarBadge::new(self.hwnd, cell);
+        }
+        // How close the next harvest is (read at most once a minute).
+        if self.harvest_wait.is_none_or(|(_, at)| at.elapsed() > Duration::from_secs(60)) {
+            self.harvest_wait = Some((super::solar::harvest_wait(), Instant::now()));
+        }
+        let wait = self.harvest_wait.map_or(0, |(w, at)| w.saturating_sub(at.elapsed().as_secs()));
+        let progress = 1.0 - wait as f32 / crate::solar::HARVEST_EVERY as f32;
+        let mut win = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.hwnd, &mut win);
+        }
+        let t = self.star_t0.elapsed().as_secs_f32();
+        let accent = self.theme.accent;
+        let margin = self.s(10);
+        if let Some(s) = &mut self.star {
+            let (x, y) = super::solar::badge_path(win, margin + s.size() / 2, t);
+            s.update(x, y, t, progress, accent);
+        }
+    }
+
+    // ----- Typing Test --------------------------------------------------------
+
+    /// Picks the test length (remembered) and starts afresh.
+    pub fn set_typing_kind(&mut self, k: crate::typing::Kind) {
+        let store = self.typing_store.get_or_insert_with(crate::typing::Store::load);
+        store.kind = k;
+        store.save();
+        self.typing_restart();
+    }
+
+    /// A fresh test of the last-used length.
+    fn typing_restart(&mut self) {
+        let kind = self.typing_store.get_or_insert_with(crate::typing::Store::load).kind;
+        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
+        self.typing = Some(Box::new(crate::typing::Test::new(kind, seed)));
+        self.typing_new_best = false;
+        self.harvest = None;
+        self.harvest_wait = self.config.config.module_enabled("solar").then(|| (super::solar::harvest_wait(), Instant::now()));
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TYPING_TIMER);
+        }
+        self.invalidate();
+    }
+
+    fn on_type_char(&mut self, code: u16) {
+        if self.mode != Mode::Typing {
+            return;
+        }
+        let Some(t) = &mut self.typing else { return };
+        if t.finished.is_some() {
+            return;
+        }
+        let was_running = t.running();
+        match code {
+            0x08 => t.backspace(),
+            0x7F => t.backspace_word(),
+            0x20 => t.space(),
+            c => {
+                // Lone surrogate halves (emoji) are skipped.
+                let Some(ch) = char::from_u32(c as u32) else { return };
+                t.type_char(ch);
+            }
+        }
+        if !was_running && t.running() {
+            unsafe {
+                SetTimer(Some(self.hwnd), TYPING_TIMER, 100, None);
+            }
+        }
+        if t.finished.is_some() {
+            self.typing_finished();
+        }
+        self.invalidate();
+    }
+
+    fn on_typing_timer(&mut self) {
+        let Some(t) = &mut self.typing else { return };
+        if t.tick() {
+            self.typing_finished();
+        }
+        self.invalidate();
+    }
+
+    /// One frame of the fly-off; ends it when done.
+    fn on_fly_timer(&mut self) {
+        let Some(fx) = &mut self.fly else {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), FLY_TIMER);
+            }
+            return;
+        };
+        let e = fx.start.elapsed().as_secs_f32();
+        if e > FLY_SECS {
+            self.fly = None;
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), FLY_TIMER);
+            }
+            return;
+        }
+        let (gw, gh) = (fx.ov.gw as i32, fx.ov.gh as i32);
+        let parts = std::mem::take(&mut fx.parts);
+        {
+            let grid = fx.ov.grid();
+            grid.fill(super::fidget::KEY);
+            let mut put = |x: f32, y: f32, c: u32| {
+                let (xi, yi) = (x as i32, y as i32);
+                if xi >= 0 && yi >= 0 && xi < gw && yi < gh {
+                    grid[(yi * gw + xi) as usize] = if c == super::fidget::KEY { c ^ 0x100 } else { c };
+                }
+            };
+            for &(x, y, tx, ty, rgb, delay, seed) in &parts {
+                let r1 = (seed >> 8 & 0xFF) as f32 / 255.0;
+                let r2 = (seed >> 16 & 0xFF) as f32 / 255.0;
+                if rgb == 0 {
+                    // Mistyped: drops away and thins out.
+                    let u = e / 0.8;
+                    if u >= 1.0 || r1 < u {
+                        continue;
+                    }
+                    put(x + (r2 - 0.5) * 10.0 * u, y + u * u * 50.0, 0x8A8A96);
+                    continue;
+                }
+                if e < delay {
+                    // A shimmer in place as the word comes apart.
+                    let j = ((e * 40.0 + seed as f32).sin() * (e / delay.max(0.01))).round();
+                    put(x + j, y, rgb);
+                    continue;
+                }
+                let u = (e - delay) / 1.0;
+                if u >= 1.0 {
+                    continue;
+                }
+                // A curve: up and out, speeding up.
+                let ease = u * u * (3.0 - 2.0 * u) * 0.4 + u * u * 0.6;
+                let (cx, cy) = (x + (tx - x) * 0.3 + (r1 - 0.5) * 30.0, y.min(ty) - 15.0 - r2 * 40.0);
+                let a = 1.0 - ease;
+                let bx = a * a * x + 2.0 * a * ease * cx + ease * ease * tx;
+                let by = a * a * y + 2.0 * a * ease * cy + ease * ease * ty;
+                put(bx, by, rgb);
+                // A short trail behind it.
+                let u2 = (u - 0.04).max(0.0);
+                let e2 = u2 * u2 * (3.0 - 2.0 * u2) * 0.4 + u2 * u2 * 0.6;
+                let a2 = 1.0 - e2;
+                if (seed & 1) == 0 {
+                    put(a2 * a2 * x + 2.0 * a2 * e2 * cx + e2 * e2 * tx, a2 * a2 * y + 2.0 * a2 * e2 * cy + e2 * e2 * ty, rgb);
+                }
+            }
+        }
+        fx.parts = parts;
+        fx.ov.present();
+    }
+
+    /// Feeds a finished test to the Solar System (once an hour) and starts
+    /// the words-to-pixels animation.
+    fn typing_harvest(&mut self) {
+        if !self.config.config.module_enabled("solar") {
+            return;
+        }
+        let Some(test) = self.typing.as_ref() else { return };
+        let words = test.correct_words();
+        let r = super::solar::harvest(&words);
+        self.harvest = Some(r);
+        self.harvest_wait = Some((super::solar::harvest_wait(), Instant::now()));
+        let gained: u32 = r.map_or(0, |g| g.iter().sum());
+        if gained == 0 || !self.animations() || super::headless() {
+            return;
+        }
+        self.fly = self.make_fly();
+        if self.fly.is_some() {
+            unsafe {
+                SetTimer(Some(self.hwnd), FLY_TIMER, 16, None);
+            }
+        }
+    }
+
+    /// Builds the fly-off from where the words were last drawn.
+    pub fn make_fly(&self) -> Option<FlyFx> {
+        let test = self.typing.as_ref()?;
+        let mon = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) };
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        unsafe {
+            let _ = GetMonitorInfoW(mon, &mut mi);
+        }
+        let cell = ((2.0 * self.unit()).round() as i32).max(2);
+        let ov = super::fidget::Overlay::new(None, mi.rcMonitor, cell)?;
+        let (gw, gh) = (ov.gw as f32, ov.gh as f32);
+        let to_grid = |sx: i32, sy: i32| ((sx - ov.left) as f32 / cell as f32, (sy - ov.top) as f32 / cell as f32);
+        // Into the Solar System's toolbar if it's open, else off the sides.
+        let bar = super::solar::toolbar_rect().map(|r| to_grid((r.left + r.right) / 2, (r.top + r.bottom) / 2));
+        let lr = self.list_rect();
+        let mut parts = Vec::new();
+        let mut seed = 0x2468_ACE1u32;
+        for &(i, x, top, lh) in self.typing_words.borrow().iter() {
+            let Some(typed) = test.typed.get(i).filter(|t| !t.is_empty()) else { continue };
+            let word = test.words[i];
+            let rgb = if typed == word { crate::solar::classify(word).rgb() } else { 0 };
+            let shown = if typed.chars().count() > word.chars().count() { typed.as_str() } else { word };
+            let Some((cov, tw, th)) = super::fidget::rasterize(shown, self.fonts.typing) else { continue };
+            let mut pt = POINT { x, y: top + (lh - th) / 2 };
+            unsafe {
+                let _ = ClientToScreen(self.hwnd, &mut pt);
+            }
+            let along = ((x - lr.left) as f32 / (lr.right - lr.left).max(1) as f32).clamp(0.0, 1.0);
+            for (gx, gy) in super::fidget::sample_cells(&cov, tw, th, pt.x - ov.left, pt.y - ov.top, cell) {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                let r = (seed >> 24) as f32 / 255.0;
+                let (x, y) = (gx as f32, gy as f32);
+                let (tx, ty) = match bar {
+                    Some((bx, by)) => (bx + (r - 0.5) * 60.0, by + ((seed >> 4 & 0xFF) as f32 / 255.0 - 0.5) * 8.0),
+                    None => {
+                        let side = if x < gw / 2.0 { -6.0 } else { gw + 6.0 };
+                        (side, (y + (r - 0.5) * gh * 0.5).clamp(0.0, gh))
+                    }
+                };
+                let delay = 0.08 + along * 0.35 + r * 0.12;
+                parts.push((x, y, tx, ty, rgb, delay, seed));
+                if parts.len() >= 3000 {
+                    break;
+                }
+            }
+        }
+        (!parts.is_empty()).then(|| FlyFx { ov, start: Instant::now(), parts })
+    }
+
+    fn typing_finished(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TYPING_TIMER);
+        }
+        let Some((kind, score)) = self.typing.as_ref().and_then(|t| Some((t.kind, t.finished?))) else { return };
+        let store = self.typing_store.get_or_insert_with(crate::typing::Store::load);
+        self.typing_new_best = store.record(kind, &score);
+        store.save();
+        self.typing_harvest();
+    }
+
+    // ----- Greek Letters ------------------------------------------------------
+
+    fn greek_rows(&mut self, q: &Query) -> Vec<Row> {
+        let hits: Vec<&crate::greek::Letter> = crate::greek::LETTERS
+            .iter()
+            .filter(|l| q.is_empty() || q.score(&format!("{} {} {}", l.name, l.lower, l.upper)).is_some())
+            .collect();
+        if hits.is_empty() {
+            self.list_message = Some("No Greek letter by that name".into());
+            return Vec::new();
+        }
+        let hint = if self.config.config.greek_hotkey.trim().is_empty() {
+            "Greek Letters"
+        } else {
+            "Greek Letters · or type the key, then your Greek hotkey"
+        };
+        let mut rows = vec![Row::Header(hint)];
+        rows.extend(hits.into_iter().map(|l| Row::Item(greek_item(l))));
+        rows
     }
 
     // ----- dragging & fidget mode ------------------------------------------
@@ -2311,6 +3030,56 @@ impl Launcher {
     }
 }
 
+/// The Typing Test length menu: time or word count.
+fn typing_menu(hwnd: HWND, pt: POINT, cur: Option<crate::typing::Kind>) -> Option<crate::typing::Kind> {
+    use crate::typing::{COUNTS, Kind, TIMES};
+    let kinds: Vec<Kind> = TIMES.iter().map(|&s| Kind::Time(s)).chain(COUNTS.iter().map(|&n| Kind::Words(n))).collect();
+    unsafe {
+        let menu = CreatePopupMenu().ok()?;
+        for (i, k) in kinds.iter().enumerate() {
+            if i == TIMES.len() {
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            }
+            let label = wide(&match k {
+                Kind::Time(s) => format!("{s} seconds"),
+                Kind::Words(n) => format!("{n} words"),
+            });
+            let flags = if Some(*k) == cur { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(menu, flags, i + 1, PCWSTR(label.as_ptr()));
+        }
+        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, Some(0), hwnd, None);
+        let _ = DestroyMenu(menu);
+        (cmd.0 as usize).checked_sub(1).and_then(|i| kinds.get(i).copied())
+    }
+}
+
+/// Greek letters whose name the query spells out ("pi", "theta") or starts (3+ letters).
+fn greek_matches(query: &str) -> Vec<&'static crate::greek::Letter> {
+    let q = query.trim().to_lowercase();
+    if q.len() < 2 || !q.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Vec::new();
+    }
+    crate::greek::LETTERS
+        .iter()
+        .filter(|l| {
+            let n = l.name.to_lowercase();
+            n == q || (q.len() >= 3 && n.starts_with(&q))
+        })
+        .collect()
+}
+
+fn greek_item(l: &crate::greek::Letter) -> crate::providers::Item {
+    crate::providers::Item {
+        key: format!("greek:{}", l.name),
+        title: l.name.to_string(),
+        subtitle: format!("{}  {}", l.lower, l.upper),
+        accessory: format!("Key {}", l.key.to_ascii_uppercase()),
+        icon: crate::providers::Icon::Char(l.lower),
+        action: Action::Greek { lower: l.lower, upper: l.upper },
+        score: 0,
+    }
+}
+
 fn text_height(font: HFONT) -> i32 {
     unsafe {
         let hdc: HDC = GetDC(None);
@@ -2447,6 +3216,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             post(hwnd, WM_APP_HIDE);
             return LRESULT(0);
         }
+        WM_APP_TYPING_MENU => {
+            // A modal menu loop: the state isn't borrowed while it runs.
+            let cur = unsafe { (*ptr).typing.as_ref().map(|t| t.kind) };
+            let pt = POINT { x: (lp.0 & 0xFFFF) as i16 as i32, y: ((lp.0 >> 16) & 0xFFFF) as i16 as i32 };
+            if let Some(k) = typing_menu(hwnd, pt, cur) {
+                unsafe { (*ptr).set_typing_kind(k) };
+            }
+            return LRESULT(0);
+        }
         WM_APP_TRAY => {
             let event = loword(lp.0 as usize);
             if event == WM_LBUTTONUP {
@@ -2545,6 +3323,42 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             ui.on_sysinfo(*s);
             LRESULT(0)
         }
+        WM_APP_MEDIA => {
+            let np = unsafe { Box::from_raw(lp.0 as *mut Option<crate::media::NowPlaying>) };
+            ui.on_media(*np);
+            LRESULT(0)
+        }
+        WM_APP_TYPE_CHAR => {
+            ui.on_type_char(wp.0 as u16);
+            LRESULT(0)
+        }
+        WM_APP_OPEN_TYPING => {
+            ui.run_command_hotkey(Command::TypingTest);
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == MEDIA_TIMER => {
+            ui.on_media_frame();
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == TYPING_TIMER => {
+            ui.on_typing_timer();
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == STAR_TIMER => {
+            ui.on_star_timer();
+            LRESULT(0)
+        }
+        WM_APP_OPEN_SOLAR => {
+            let pt = POINT { x: (lp.0 & 0xFFFF) as i16 as i32, y: ((lp.0 >> 16) & 0xFFFF) as i16 as i32 };
+            super::solar::open(hwnd, Some(pt), ui.theme.accent);
+            ui.reset_on_show = true;
+            ui.hide();
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == FLY_TIMER => {
+            ui.on_fly_timer();
+            LRESULT(0)
+        }
         WM_TIMER if wp.0 == CLOCK_TIMER => {
             if ui.top_bar().is_some() {
                 let rc = RECT { left: 0, top: 0, right: ui.client_size().0, bottom: ui.top_h() };
@@ -2614,6 +3428,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_LBUTTONDOWN => {
             let (x, y) = point_from_lparam(lp);
+            if let Some((z, rc)) = ui.zone_at(x, y) {
+                unsafe {
+                    let _ = SetFocus(Some(ui.edit));
+                }
+                ui.on_zone(z, rc, x);
+                return LRESULT(0);
+            }
             if ui.is_drag_handle(x, y) {
                 unsafe {
                     let _ = SetFocus(Some(ui.edit));
@@ -2711,6 +3532,15 @@ unsafe extern "system" fn edit_proc(
                 SendMessageW(parent, WM_APP_NAV, Some(WPARAM(k.0 as usize)), Some(LPARAM(flags)));
                 LRESULT(0)
             };
+            match PAGE_KEYS.with(|k| k.get()) {
+                PageKeys::Media if matches!(vk, VK_SPACE | VK_LEFT | VK_RIGHT) => return nav(vk),
+                // Typing Test: Backspace and editing keys are handled through WM_CHAR.
+                PageKeys::Typing if matches!(vk, VK_BACK | VK_LEFT | VK_RIGHT | VK_HOME | VK_END | VK_DELETE) => {
+                    return LRESULT(0);
+                }
+                PageKeys::Typing if ctrl && vk.0 == b'V' as u16 => return LRESULT(0), // no pasting
+                _ => {}
+            }
             match vk {
                 VK_UP | VK_DOWN | VK_RETURN | VK_ESCAPE | VK_PRIOR | VK_NEXT | VK_TAB => return nav(vk),
                 _ if ctrl && (vk.0 == b'N' as u16 || vk.0 == b'J' as u16) => return nav(VK_DOWN),
@@ -2732,9 +3562,22 @@ unsafe extern "system" fn edit_proc(
             }
         }
         WM_CHAR => {
+            let c = wp.0 as u32;
+            match PAGE_KEYS.with(|k| k.get()) {
+                PageKeys::Typing => {
+                    if c >= 0x20 || c == 0x08 {
+                        unsafe {
+                            let parent = GetParent(hwnd).unwrap_or_default();
+                            let _ = PostMessageW(Some(parent), WM_APP_TYPE_CHAR, wp, LPARAM(0));
+                        }
+                    }
+                    return LRESULT(0);
+                }
+                PageKeys::Media => return LRESULT(0),
+                PageKeys::None => {}
+            }
             // Swallow control characters produced by the keys handled above
             // (Enter, Esc, Tab, Ctrl+Backspace, Ctrl+A/N/P/J/K) to avoid beeps.
-            let c = wp.0 as u32;
             if matches!(c, 0x0D | 0x1B | 0x09 | 0x7F | 0x01 | 0x0E | 0x10 | 0x0A | 0x0B) {
                 return LRESULT(0);
             }
@@ -2765,7 +3608,10 @@ unsafe extern "system" fn edit_proc(
                 let dpi = GetDpiForWindow(hwnd).max(96);
                 let w = ((dpi as f32 / 96.0) * 2.0).round().max(1.0) as i32;
                 let _ = CreateCaret(hwnd, None, w, rc.bottom - rc.top);
-                let _ = ShowCaret(Some(hwnd));
+                // Pages that take keys themselves keep the caret hidden.
+                if PAGE_KEYS.with(|k| k.get()) == PageKeys::None {
+                    let _ = ShowCaret(Some(hwnd));
+                }
             }
             return r;
         }

@@ -1,6 +1,6 @@
 [package]
 name = "sigma5"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "SIGMA5 (S5) - a fast, lightweight launcher for Windows"
 build = "build.rs"
@@ -10,11 +10,17 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 windows = { version = "0.61", features = [
+    "Foundation",
+    "Media_Control",
+    "Storage_Streams",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Imaging",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",

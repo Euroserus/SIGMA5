@@ -215,7 +215,7 @@ pub struct TopBar {
 impl Default for TopBar {
     fn default() -> Self {
         Self {
-            items: ["clock", "date", "cpu", "ram", "gpu", "battery"].map(String::from).to_vec(),
+            items: ["clock", "date", "media", "cpu", "ram", "battery"].map(String::from).to_vec(),
             clock_24h: true,
             show_seconds: false,
         }
@@ -229,6 +229,8 @@ pub struct Config {
     pub hotkey: String,
     /// Optional shortcut that opens Clipboard History directly (empty = none).
     pub clipboard_hotkey: String,
+    /// Shortcut that turns the letter just typed Greek, anywhere (empty = none).
+    pub greek_hotkey: String,
     pub theme: ThemeMode,
     pub accent: Accent,
     pub size: UiSize,
@@ -254,6 +256,8 @@ pub struct Config {
     pub remaps: Vec<Remap>,
     pub top_bar: TopBar,
     pub appearance: Appearance,
+    /// The Solar System's star circles the launcher (click it to open).
+    pub solar_star: bool,
 }
 
 impl Default for Config {
@@ -261,6 +265,7 @@ impl Default for Config {
         Self {
             hotkey: "Alt+Space".into(),
             clipboard_hotkey: String::new(),
+            greek_hotkey: String::new(),
             theme: ThemeMode::default(),
             accent: Accent::default(),
             size: UiSize::default(),
@@ -276,6 +281,7 @@ impl Default for Config {
             remaps: Vec::new(),
             top_bar: TopBar::default(),
             appearance: Appearance::default(),
+            solar_star: true,
         }
     }
 }
@@ -308,10 +314,19 @@ impl Config {
             "\n# Caps Lock: \"default\", \"hyper\" (Ctrl+Shift+Alt), \"ctrl\", \"escape\" or \"off\"\n",
         );
         out.push_str(&format!("caps_lock = \"{}\"\n", self.caps_lock.as_str()));
+        out.push_str(
+            "\n# Greek letters: type a letter, then press this to make it Greek, SMath style\n\
+             # (q → θ, w → ω, d → δ). Press again to undo. Empty = off. E.g. \"Ctrl+Alt+Shift+G\".\n",
+        );
+        out.push_str(&format!("greek_hotkey = {:?}\n", self.greek_hotkey));
+        out.push_str(&format!(
+            "\n# A tiny star circles the launcher; click it to open your Solar System.\nsolar_star = {}\n",
+            self.solar_star
+        ));
         let items: Vec<String> = self.top_bar.items.iter().map(|i| format!("{i:?}")).collect();
         out.push_str(&format!(
-            "\n# Top bar (the \"topbar\" module), left to right. Components: clock, date, cpu, ram,\n\
-             # gpu, cpu_temp, gpu_temp, battery, net, disk.\n\
+            "\n# Top bar (the \"topbar\" module), left to right. Components: clock, date, media, cpu,\n\
+             # ram, gpu, cpu_temp, gpu_temp, battery, net, disk.\n\
              [top_bar]\nitems = [{}]\nclock_24h = {}\nshow_seconds = {}\n",
             items.join(", "),
             self.top_bar.clock_24h,
@@ -483,6 +498,8 @@ mod tests {
         let mut c = Config::default();
         c.hotkey = "Ctrl+Shift+K".into();
         c.clipboard_hotkey = "Ctrl+Alt+Shift+V".into();
+        c.greek_hotkey = "Ctrl+Alt+Shift+G".into();
+        c.solar_star = false;
         c.theme = ThemeMode::Light;
         c.accent = Accent::Teal;
         c.size = UiSize::Large;

@@ -205,3 +205,140 @@ accent_color = \"#FF8800\"
         ui.snapshot(&d.join("custom-2-calc.png"));
     });
 }
+
+impl Launcher {
+    /// Pretends a track is playing (with gradient "album art" and some level history).
+    pub fn test_media(&mut self, playing: bool) {
+        let n = 256;
+        let px = (0..n * n)
+            .map(|i| {
+                let (x, y) = (i % n, i / n);
+                (40 + x * 160 / n) << 16 | (30 + y * 90 / n) << 8 | (150 + (x + y) * 90 / (2 * n))
+            })
+            .collect();
+        let art = std::sync::Arc::new(crate::media::Art { size: n as i32, px });
+        self.on_media(Some(crate::media::NowPlaying {
+            title: "Midnight City".into(),
+            artist: "M83".into(),
+            album: "Hurry Up, We're Dreaming".into(),
+            app: "Spotify.exe".into(),
+            playing,
+            position_ms: Some(83_000),
+            duration_ms: Some(243_000),
+            read_at: Instant::now(),
+            art: Some(art),
+        }));
+        for i in 0..60 {
+            let v = ((i as f32 * 0.7).sin() * 0.5 + 0.5) * 0.6 + ((i * 37 % 11) as f32 / 11.0) * 0.4;
+            self.levels.push(v * v);
+        }
+    }
+
+    /// Types into the Typing Test as a user would.
+    pub fn test_type(&mut self, s: &str) {
+        for c in s.encode_utf16() {
+            self.on_type_char(c);
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn new_pages_snapshots() {
+    let Ok(dir) = std::env::var("SIGMA5_SNAP_DIR") else { return };
+    let dir = std::path::PathBuf::from(dir);
+    let cfg = format!("{BASE_CONFIG}\n[top_bar]\nitems = [\"clock\", \"date\", \"media\", \"cpu\", \"ram\"]\n");
+    for (theme, cfg) in [("dark", cfg.clone()), ("light", cfg.replace("\"dark\"", "\"light\""))] {
+        let dir = dir.clone();
+        run(&format!("pages-{theme}"), &cfg, move |ui| {
+            ui.test_show();
+            ui.snapshot(&dir.join(format!("{theme}-a-nothing-playing.png")));
+            ui.test_media(true);
+            ui.snapshot(&dir.join(format!("{theme}-b-topbar-media.png")));
+            ui.test_mode(Mode::Media);
+            ui.snapshot(&dir.join(format!("{theme}-c-now-playing.png")));
+            ui.test_media(false);
+            ui.snapshot(&dir.join(format!("{theme}-d-paused.png")));
+            ui.go_back();
+            ui.test_mode(Mode::Typing);
+            ui.snapshot(&dir.join(format!("{theme}-e-typing-start.png")));
+            let words: Vec<&str> = ui.typing.as_ref().unwrap().words[..10].to_vec();
+            let mut s = String::new();
+            for (i, w) in words[..9].iter().enumerate() {
+                // A couple of mistakes: a wrong letter, then an extra one.
+                let w = match i {
+                    2 => w.replacen(|_| true, "x", 1),
+                    4 => format!("{w}s"),
+                    _ => w.to_string(),
+                };
+                s.push_str(&w);
+                s.push(' ');
+            }
+            ui.test_type(&s);
+            ui.test_type(&words[9][..2]);
+            ui.snapshot(&dir.join(format!("{theme}-f-typing-run.png")));
+            // Finish a 10-word run for the results screen.
+            ui.set_typing_kind(crate::typing::Kind::Words(10));
+            let words: Vec<&str> = ui.typing.as_ref().unwrap().words.clone();
+            ui.typing.as_mut().unwrap().started = Some(Instant::now() - Duration::from_secs(9));
+            ui.test_type(&words.join(" "));
+            ui.snapshot(&dir.join(format!("{theme}-g-typing-results.png")));
+            ui.go_back();
+            ui.test_mode(Mode::Greek);
+            ui.snapshot(&dir.join(format!("{theme}-h-greek.png")));
+            ui.go_back();
+            ui.type_query("theta");
+            ui.snapshot(&dir.join(format!("{theme}-i-root-theta.png")));
+        });
+    }
+}
+
+#[test]
+#[ignore]
+fn harvest_snapshots() {
+    let Ok(dir) = std::env::var("SIGMA5_SNAP_DIR") else { return };
+    let dir = std::path::PathBuf::from(dir);
+    run("harvest", BASE_CONFIG, move |ui| {
+        ui.test_show();
+        ui.test_mode(Mode::Typing);
+        ui.snapshot(&dir.join("harvest-0-start.png"));
+        ui.set_typing_kind(crate::typing::Kind::Words(25));
+        pump(30);
+        let words: Vec<&str> = ui.typing.as_ref().unwrap().words.clone();
+        ui.typing.as_mut().unwrap().started = Some(Instant::now() - Duration::from_secs(20));
+        let mut s = String::new();
+        for (i, w) in words.iter().enumerate() {
+            if i == 3 { s.push_str("xx") } else { s.push_str(w) }
+            s.push(' ');
+        }
+        // Type all but the last word, draw a frame (records word positions), then finish.
+        let cut = s.trim_end().rfind(' ').unwrap();
+        ui.test_type(&s[..cut + 1]);
+        ui.snapshot(&dir.join("harvest-1-before.png"));
+        ui.test_type(words[24]);
+        ui.snapshot(&dir.join("harvest-2-result.png"));
+        println!("harvest: {:?}", ui.harvest);
+        // The fly-off layer (built directly: headless runs skip the animation).
+        let mut fx = ui.make_fly().expect("words to fly");
+        println!("fly-off: {} pixels on a {}x{} layer", fx.parts.len(), fx.ov.gw, fx.ov.gh);
+        assert!(fx.parts.len() > 300);
+        fx.start = Instant::now() - Duration::from_millis(500);
+        ui.fly = Some(fx);
+        ui.on_fly_timer();
+        let lit = ui.fly.as_ref().unwrap().ov.lit();
+        println!("fly-off frame: {lit} pixels lit");
+        {
+            let ov = &mut ui.fly.as_mut().unwrap().ov;
+            let (gw, gh) = (ov.gw, ov.gh);
+            let px: Vec<u32> = ov.grid().iter().enumerate().map(|(i, &c)| if c == crate::ui::fidget::KEY { if (i % gw / 40 + i / gw / 40) % 2 == 0 { 0x2A2D38 } else { 0x23252E } } else { c }).collect();
+            crate::ui::draw::write_png(&dir.join("harvest-3-flyoff.png").to_string_lossy(), &px, gw, gh, 2);
+        }
+        assert!(lit > 100);
+        ui.fly.as_mut().unwrap().start = Instant::now() - Duration::from_secs(3);
+        ui.on_fly_timer();
+        assert!(ui.fly.is_none(), "it ends on its own");
+        // A second test in the same hour is practice.
+        ui.typing_restart();
+        ui.snapshot(&dir.join("harvest-7-practice.png"));
+    });
+}

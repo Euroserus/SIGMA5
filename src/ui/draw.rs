@@ -147,6 +147,11 @@ impl BackBuffer {
         self.dc
     }
 
+    /// The buffer's DC if it already holds a frame of this size.
+    pub fn current(&self, w: i32, h: i32) -> Option<HDC> {
+        (!self.dc.is_invalid() && self.w == w && self.h == h).then_some(self.dc)
+    }
+
     pub fn release(&mut self) {
         if !self.dc.is_invalid() {
             unsafe {

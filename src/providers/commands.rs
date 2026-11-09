@@ -16,12 +16,15 @@ pub struct CommandsProvider {
     id: &'static str,
     section: &'static str,
     defs: &'static [Def],
+    /// How many of `defs` show when browsing (the rest are found by searching).
+    browse: usize,
 }
 
 // Glyphs are Segoe Fluent Icons code points.
 pub const SIGMA5: CommandsProvider = CommandsProvider {
     id: "commands",
     section: "SIGMA5",
+    browse: usize::MAX,
     defs: &[
         Def { title: "Reload Applications", subtitle: "", keywords: "refresh reindex rescan apps", glyph: '\u{E72C}', cmd: Command::ReloadApps },
         Def { title: "SIGMA5 Settings", subtitle: "", keywords: "config preferences options hotkey theme", glyph: '\u{E713}', cmd: Command::OpenSettings },
@@ -35,6 +38,7 @@ pub const SIGMA5: CommandsProvider = CommandsProvider {
 pub const WINGET: CommandsProvider = CommandsProvider {
     id: "winget",
     section: "WinGet",
+    browse: usize::MAX,
     defs: &[
         Def { title: "Search Packages", subtitle: "WinGet", keywords: "winget install find download app", glyph: '\u{E7B8}', cmd: Command::WingetSearch },
         Def { title: "Upgrade All Packages", subtitle: "WinGet", keywords: "winget update everything", glyph: '\u{E7B8}', cmd: Command::WingetUpgradeAll },
@@ -48,6 +52,7 @@ pub const WINGET: CommandsProvider = CommandsProvider {
 pub const CLIPBOARD: CommandsProvider = CommandsProvider {
     id: "clipboard",
     section: "Clipboard",
+    browse: usize::MAX,
     defs: &[
         Def { title: "Clipboard History", subtitle: "Clipboard", keywords: "paste copied history", glyph: '\u{E77F}', cmd: Command::ClipboardHistory },
         Def { title: "Clear Clipboard History", subtitle: "Clipboard", keywords: "delete wipe forget", glyph: '\u{E74D}', cmd: Command::ClearClipboard },
@@ -57,6 +62,7 @@ pub const CLIPBOARD: CommandsProvider = CommandsProvider {
 pub const FILES: CommandsProvider = CommandsProvider {
     id: "files",
     section: "Files",
+    browse: usize::MAX,
     defs: &[
         Def { title: "Search Files", subtitle: "Files", keywords: "find file folder document recent explorer open", glyph: '\u{E8B7}', cmd: Command::SearchFiles },
     ],
@@ -65,6 +71,7 @@ pub const FILES: CommandsProvider = CommandsProvider {
 pub const COLORS: CommandsProvider = CommandsProvider {
     id: "colors",
     section: "Colours",
+    browse: usize::MAX,
     defs: &[
         Def { title: "Pick Colour", subtitle: "Colours", keywords: "color picker eyedropper dropper hex rgb screen sample", glyph: '\u{EF3C}', cmd: Command::PickColor },
         Def { title: "Colour History", subtitle: "Colours", keywords: "color picked palette saved hex", glyph: '\u{E790}', cmd: Command::ColorHistory },
@@ -72,8 +79,47 @@ pub const COLORS: CommandsProvider = CommandsProvider {
     ],
 };
 
+pub const MEDIA: CommandsProvider = CommandsProvider {
+    id: "media",
+    section: "Media",
+    browse: 1,
+    defs: &[
+        Def { title: "Now Playing", subtitle: "Media", keywords: "spotify music song player track media controls", glyph: '\u{E8D6}', cmd: Command::NowPlaying },
+        Def { title: "Play/Pause", subtitle: "Media", keywords: "spotify music pause resume toggle", glyph: '\u{E768}', cmd: Command::MediaPlayPause },
+        Def { title: "Next Track", subtitle: "Media", keywords: "spotify music skip forward song", glyph: '\u{E893}', cmd: Command::MediaNext },
+        Def { title: "Previous Track", subtitle: "Media", keywords: "spotify music back last song", glyph: '\u{E892}', cmd: Command::MediaPrevious },
+    ],
+};
+
+pub const TYPING: CommandsProvider = CommandsProvider {
+    id: "typing",
+    section: "Typing",
+    browse: usize::MAX,
+    defs: &[
+        Def { title: "Typing Test", subtitle: "", keywords: "type speed wpm practice trainer keyboard monkeytype", glyph: '\u{E765}', cmd: Command::TypingTest },
+    ],
+};
+
+pub const GREEK: CommandsProvider = CommandsProvider {
+    id: "greek",
+    section: "Greek",
+    browse: usize::MAX,
+    defs: &[
+        Def { title: "Greek Letters", subtitle: "", keywords: "alphabet symbol alpha theta omega smath maths copy", glyph: '\u{E8D2}', cmd: Command::GreekLetters },
+    ],
+};
+
+pub const SOLAR: CommandsProvider = CommandsProvider {
+    id: "solar",
+    section: "Solar System",
+    browse: usize::MAX,
+    defs: &[
+        Def { title: "Solar System", subtitle: "", keywords: "planets space star universe game build typing orbit", glyph: '\u{E706}', cmd: Command::SolarSystem },
+    ],
+};
+
 /// Every command list, for finding a command by its key (used by hotkeys).
-const ALL: [&CommandsProvider; 5] = [&SIGMA5, &WINGET, &CLIPBOARD, &FILES, &COLORS];
+const ALL: [&CommandsProvider; 9] = [&SIGMA5, &WINGET, &CLIPBOARD, &FILES, &COLORS, &MEDIA, &TYPING, &GREEK, &SOLAR];
 
 /// A command from its history/hotkey key ("cmd:PickColor"): its module id,
 /// title, glyph and the command itself.
@@ -120,7 +166,7 @@ impl Provider for CommandsProvider {
     }
 
     fn browse(&self, out: &mut Vec<Item>) {
-        out.extend(self.defs.iter().map(|d| item(d, 0)));
+        out.extend(self.defs.iter().take(self.browse).map(|d| item(d, 0)));
     }
 
     fn lookup(&self, k: &str) -> Option<Item> {
@@ -139,5 +185,9 @@ mod tests {
         assert_eq!(find("cmd:SearchFiles").unwrap().3, Command::SearchFiles);
         assert!(find("cmd:Nope").is_none());
         assert!(find("Microsoft.WindowsCalculator").is_none());
+        assert_eq!(find("cmd:MediaNext").unwrap().0, "media");
+        let mut v = Vec::new();
+        MEDIA.browse(&mut v);
+        assert_eq!(v.len(), 1, "only Now Playing shows when browsing");
     }
 }

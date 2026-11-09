@@ -155,6 +155,7 @@ enum Btn {
 enum Rec {
     Launcher,
     ClipHotkey,
+    GreekHotkey,
     App(usize),
     DraftApp,
     From(usize),
@@ -238,6 +239,7 @@ enum Ctl {
     Nav(Page),
     Rec(Rec),
     ClearClipHotkey,
+    ClearGreekHotkey,
     AutoUpdate,
     WindowsKey,
     StartWithWindows,
@@ -253,6 +255,7 @@ enum Ctl {
     Clock24,
     ClockSecs,
     Anims,
+    SolarStar,
     FontMenu(FontTarget),
     ColorPick(ColorTarget),
     ColorPaste(ColorTarget),
@@ -515,6 +518,9 @@ impl Settings {
         if except != Rec::ClipHotkey && same(&self.cfg().clipboard_hotkey) {
             return Some("Clipboard History".into());
         }
+        if except != Rec::GreekHotkey && same(&self.cfg().greek_hotkey) {
+            return Some("Greek letters".into());
+        }
         self.cfg()
             .app_hotkeys
             .iter()
@@ -531,7 +537,7 @@ impl Settings {
             return;
         }
         match r {
-            Rec::Launcher | Rec::ClipHotkey | Rec::App(_) | Rec::DraftApp => {
+            Rec::Launcher | Rec::ClipHotkey | Rec::GreekHotkey | Rec::App(_) | Rec::DraftApp => {
                 let spec = match hotkey::format(mods, code) {
                     Ok(s) => s,
                     Err(e) => {
@@ -548,6 +554,7 @@ impl Settings {
                 let current = match r {
                     Rec::Launcher => self.cfg().hotkey.clone(),
                     Rec::ClipHotkey => self.cfg().clipboard_hotkey.clone(),
+                    Rec::GreekHotkey => self.cfg().greek_hotkey.clone(),
                     Rec::App(i) => self.cfg().app_hotkeys.get(i).map(|b| b.hotkey.clone()).unwrap_or_default(),
                     _ => String::new(),
                 };
@@ -561,6 +568,11 @@ impl Settings {
                 match r {
                     Rec::Launcher => c.hotkey = spec,
                     Rec::ClipHotkey => c.clipboard_hotkey = spec,
+                    Rec::GreekHotkey => {
+                        c.greek_hotkey = spec;
+                        // Setting the hotkey means wanting the feature.
+                        c.disabled_modules.retain(|m| m != "greek");
+                    }
                     Rec::App(i) => {
                         if let Some(b) = c.app_hotkeys.get_mut(i) {
                             b.hotkey = spec;
@@ -671,7 +683,7 @@ impl Settings {
         }
         let is_toggle = matches!(
             ctl,
-            Ctl::AutoUpdate | Ctl::WindowsKey | Ctl::StartWithWindows | Ctl::Module(_) | Ctl::TopItem(_) | Ctl::Clock24 | Ctl::ClockSecs | Ctl::Anims
+            Ctl::AutoUpdate | Ctl::WindowsKey | Ctl::StartWithWindows | Ctl::Module(_) | Ctl::TopItem(_) | Ctl::Clock24 | Ctl::ClockSecs | Ctl::Anims | Ctl::SolarStar
         );
         if is_toggle && self.animations() {
             self.toggle_anim = Some((ctl, Instant::now()));
@@ -694,6 +706,10 @@ impl Settings {
             }
             Ctl::ClearClipHotkey => {
                 self.store.config.clipboard_hotkey.clear();
+                self.commit();
+            }
+            Ctl::ClearGreekHotkey => {
+                self.store.config.greek_hotkey.clear();
                 self.commit();
             }
             Ctl::AutoUpdate => {
@@ -788,6 +804,10 @@ impl Settings {
             }
             Ctl::Anims => {
                 self.store.config.appearance.animations ^= true;
+                self.commit();
+            }
+            Ctl::SolarStar => {
+                self.store.config.solar_star ^= true;
                 self.commit();
             }
             Ctl::FontMenu(which) => self.request_menu(MenuFor::Font(which)),
@@ -1600,6 +1620,26 @@ impl Settings {
         };
         self.labels(dc, &rc, ix, left - self.s(12), "Caps Lock", desc, t.subtext);
 
+        // Greek letters hotkey (optional)
+        let rc = self.card(dc, x0, x1, rc.bottom + self.s(ROW_GAP), self.s(ROW_H));
+        let cy = (rc.top + rc.bottom) / 2;
+        let rec = self.recording == Some(Rec::GreekHotkey);
+        let spec = self.cfg().greek_hotkey.clone();
+        let mut box_right = right;
+        if !spec.is_empty() && !rec {
+            box_right = self.icon_button(dc, right, cy, '\u{E711}', Ctl::ClearGreekHotkey) - self.s(8);
+        }
+        let labels = if rec { self.live_keys() } else { hotkey::parts(&spec) };
+        let b = self.keys_box(dc, box_right, true, cy, &labels, if rec { "Press keys…" } else { "Not set" }, rec, Ctl::Rec(Rec::GreekHotkey), self.s(150));
+        let module_on = self.cfg().module_enabled("greek");
+        let (desc, col) = match (self.error_for(|r| r == Rec::GreekHotkey), rec) {
+            (Some(e), _) => (e, t.warn),
+            (None, true) => ("Press the shortcut (Caps + G if Caps is Hyper), or Esc".to_string(), t.accent),
+            (None, false) if !spec.is_empty() && !module_on => ("Greek Letters is off under Modules".to_string(), t.warn),
+            (None, false) => ("Makes the letter you just typed Greek: q → θ".to_string(), t.subtext),
+        };
+        self.labels(dc, &rc, ix, b.left - self.s(16), "Greek letter hotkey", &desc, col);
+
         // Remaps
         let mut y = rc.bottom + self.s(22);
         let hr = RECT { left: x0 + self.s(4), top: y, right: x1, bottom: y + self.s(22) };
@@ -1668,7 +1708,18 @@ impl Settings {
             let left = self.toggle(dc, right, cy, enabled, Ctl::Module(i));
             self.labels(dc, &rc, tr.right + self.s(14), left - self.s(16), ext.name, ext.description, t.subtext);
         }
-        let ny = self.row_y(y, MODULES.len() as i32) + self.s(6);
+        // The Solar System's star round the launcher.
+        let rc = self.card(dc, x0, x1, self.row_y(y, MODULES.len() as i32) + self.s(10), rh);
+        let cy = (rc.top + rc.bottom) / 2;
+        let on = self.cfg().solar_star;
+        let left = self.toggle(dc, right, cy, on, Ctl::SolarStar);
+        let desc = if self.cfg().module_enabled("solar") {
+            "Your star circles the launcher; click it to open your Solar System"
+        } else {
+            "Needs the Solar System module"
+        };
+        self.labels(dc, &rc, x0 + self.s(20), left - self.s(16), "Orbiting star", desc, t.subtext);
+        let ny = rc.bottom + self.s(12);
         self.note(dc, x0, x1, ny, "Turned-off modules use no memory or CPU. More are on the way.", t.subtext)
     }
 
@@ -1705,6 +1756,8 @@ impl Settings {
                 left = self.icon_button(dc, down - self.s(2), cy, '\u{E70E}', Ctl::TopMove(i, -1));
             }
             let desc = match info.id {
+                "media" if !self.cfg().module_enabled("media") => "Turn on Now Playing under Modules to see it",
+                "media" => "Spotify or whatever's playing; click it for controls",
                 "cpu_temp" => "Where Windows exposes an ACPI thermal zone; many laptops don't",
                 "gpu_temp" => "NVIDIA GPUs (through the driver)",
                 "net" => "Download and upload, all adapters",
@@ -2141,6 +2194,8 @@ mod snapshots {
         std::fs::write(
             tmp.join("SIGMA5").join("config.toml"),
             "theme = \"dark\"
+caps_lock = \"hyper\"
+greek_hotkey = \"Ctrl+Alt+Shift+G\"
 [[app_hotkeys]]
 hotkey = \"Ctrl+Alt+Shift+P\"
 app = \"cmd:PickColor\"
@@ -2158,7 +2213,7 @@ name = \"Pick Colour\"
             let hwnd = OPEN.with(|c| c.get());
             let st = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Settings);
             let (w, h) = (st.s(CLIENT_W), st.s(1500));
-            for page in [Page::General, Page::Appearance, Page::Hotkeys] {
+            for page in [Page::General, Page::Appearance, Page::Hotkeys, Page::Keyboard, Page::Modules, Page::TopBar] {
                 st.page = page;
                 st.scroll = 0;
                 let dc = CreateCompatibleDC(None);

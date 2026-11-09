@@ -41,6 +41,7 @@ pub const NEED_DISK: u32 = 128;
 pub const ITEMS: &[ItemInfo] = &[
     ItemInfo { id: "clock", name: "Clock", glyph: '\u{E823}', needs: 0 },
     ItemInfo { id: "date", name: "Date", glyph: '\u{E787}', needs: 0 },
+    ItemInfo { id: "media", name: "Now playing", glyph: '\u{E8D6}', needs: 0 },
     ItemInfo { id: "cpu", name: "CPU usage", glyph: '\u{E950}', needs: NEED_CPU },
     ItemInfo { id: "ram", name: "Memory", glyph: '\u{E964}', needs: NEED_RAM },
     ItemInfo { id: "gpu", name: "GPU usage", glyph: '\u{F211}', needs: NEED_GPU },

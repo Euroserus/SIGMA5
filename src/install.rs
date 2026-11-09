@@ -26,9 +26,9 @@ use crate::util::wide;
 /// "0.3.0" for published releases, "0.3.0-dev" for any other build (see build.rs).
 pub const VERSION: &str = env!("SIGMA5_VERSION");
 /// Each release is named after a famous engineer or researcher.
-pub const CODENAME: &str = "Charpy";
+pub const CODENAME: &str = "Newton";
 
-/// "0.3.0 “Charpy”"
+/// "0.4.0 “Newton”"
 pub fn version_label() -> String {
     format!("{VERSION} “{CODENAME}”")
 }

@@ -17,11 +17,14 @@ Built by a Mechanical Engineering student, for engineering students. Raycast-sty
 - **File search** across your user folder (Desktop, Documents, OneDrive…) with typo-tolerant fuzzy matching (`brkt mount` finds `bracket_mount.SLDPRT`), plus your recent files.
 - **Colour picker** with a magnifying loupe, colour history, and `#hex` / `rgb()` / `hsl()` conversion as you type.
 - **Top bar** with a clock and live CPU, RAM, GPU, temperatures, battery, network and disk readings: pick and order them yourself.
+- **Now Playing:** what Spotify (or any player) is playing, with album art and a live waveform in the top bar; click it for play, pause, skip and seek.
+- **Greek letters anywhere, SMath style:** type `q`, press your Greek hotkey, get `θ`.
+- **Typing Test** with timed and word-count runs, WPM, accuracy and personal bests, which also feeds a **Solar System** you build a planet at a time.
 - **Make it yours:** square or rounded corners, fonts, text size, window and row size, and every colour.
 
 ### Releases
 
-Each release is named after a famous engineer or researcher. The current release is **0.3 “Charpy”**, after Georges Charpy, whose impact test is still how engineers measure a material's toughness. Before it came 0.2 “Euler”, after Leonhard Euler.
+Each release is named after a famous engineer or researcher. The current release is **0.4 “Newton”**, after Isaac Newton, whose laws of motion and gravity keep the new Solar System's planets in orbit. Before it came 0.3 “Charpy”, after Georges Charpy (whose impact test still measures a material's toughness), and 0.2 “Euler”, after Leonhard Euler.
 
 SIGMA5 updates itself: installed copies check GitHub every 12 hours and offer new versions in the launcher. One Enter downloads it, verifies its SHA-256 checksum and swaps it in, keeping your settings.
 
@@ -72,6 +75,31 @@ Type a few letters of a file or folder name and the best matches appear under yo
 ### Top bar
 
 A strip above the search box with a clock, the date and live readings: CPU, RAM and GPU use (with meters), CPU and GPU temperature, battery, network speed and free disk space. Choose and order them under Settings › Top Bar. Readings are taken once a second only while the launcher is open (about 2 ms each), so it costs nothing in the background. GPU temperature needs an NVIDIA driver; CPU temperature needs a PC that exposes an ACPI thermal zone, which many laptops don't. Unavailable readings show "—".
+
+### Now Playing
+
+Shows what's playing in Spotify, a browser, or any app that appears in Windows' media controls, read through Windows itself (no sign-in or web API). Add *Now playing* to the top bar under Settings › Top Bar: it shows the album art, a little waveform driven by the player's actual audio output, and the track. Click it (or search *Now Playing*) for the full card: art, track and album, progress (click to seek), previous / play-pause / next, and a button to bring the player forward. **Space** plays or pauses and **← →** skip. *Play/Pause*, *Next Track* and *Previous Track* are commands too, so they can have hotkeys. Windows doesn't expose a player's queue, so there is no queue view. Nothing runs while the launcher is closed.
+
+### Greek letters
+
+Set a hotkey under Settings › Keyboard › *Greek letter hotkey* (with Caps Lock as Hyper, Caps+G works well). Then, in any app, type a letter and press it: the letter becomes its Greek twin, using the same keys as SMath Studio and Mathcad (the classic Symbol font): `a b g d e z h q i k l m n x o p r s t u f c y w` → `α β γ δ ε ζ η θ ι κ λ μ ν ξ ο π ρ σ τ υ φ χ ψ ω`, capitals likewise, plus `j` → `ϕ` and `v` → `ϖ`. Press it again to turn it back. A mouse click or any other key in between cancels it, so it never deletes the wrong character. Search *Greek Letters* (or a name like `theta`) to copy one: Enter copies the small letter, Shift+Enter the capital.
+
+### Typing Test
+
+Search *Typing Test* and start typing: the clock starts on your first key. The length (15, 30, 60 or 120 seconds, or 10, 25, 50 or 100 words) is in the small menu above the words. Mistakes show in red as you go, and you can only go back into a word you got wrong. When it ends you get your WPM (from correctly typed words), accuracy and raw speed, and whether it's a personal best (runs under 75% accuracy don't count). **Tab** or **Enter** goes again, **Esc** goes back.
+
+### Solar System
+
+Every word you type correctly in a typing test becomes a particle of material, depending on the kind of word: little words (*the, of, and*) make **hydrogen**, nouns make **rock**, verbs make **water**, describing words make **iron**, and long words (8+ letters) make rare **carbon**. Only the first test each hour is harvested. When it ends, the words break into coloured pixels and fly off the sides of your screen (or into the Solar System's toolbar if it's open).
+
+While the launcher is open, a tiny pixel star circles its window. The ring round it fills as the next harvest comes due, and glows when a typing test will count. Click it (or search *Solar System*) and your system unfolds over the whole screen. Your star sits in the middle, its planets orbit over your desktop, and everything, interface included, is drawn as pixels. While it's open it takes every click, so nothing reaches the apps behind. **Esc** (or switching to another app) puts it away at once. You can turn the orbiting star off under Settings › Modules.
+
+- **Release material:** pick one in the toolbar (or press 1–5) and hold the mouse anywhere. The particles stay particles: they pull together into a clump at that spot, and that clump is your new world, about one pixel per particle. Release near a planet and they settle onto it in layers: iron sinks to the core, then rock, carbon and water, with hydrogen as a hazy shell. Adding water to a rocky world really does give it a blue layer.
+- **Move a planet:** drag it. It keeps a steady circular orbit at whatever distance you leave it.
+- **Look at a planet:** click it to see its make-up and its orbit; click the name (or press F2) to rename it, and right-click to deselect.
+- **What happens on its own:** a small planet that comes close to a big one is captured as a moon, similar-sized ones merge, and anything that strays too close falls into your star.
+
+It's saved in `%APPDATA%\SIGMA5\solar.json`, and a new system starts with a little material to try out. Everything is drawn in software on the same click-through layer as fidget mode (only what changed reaches the screen), at about 1 ms a frame: 30 fps when idle, 60 while you're doing something. Put away, it costs nothing.
 
 ### Appearance
 
@@ -224,6 +252,10 @@ src/
   keys.rs            key names/codes, numpad handling, remap targets
   files.rs           file index (compact, fuzzy two-pass search) and Windows' recent files
   colors.rs          colour parsing, formats and picked-colour history
+  media.rs           Now Playing: Windows media sessions, album art (WIC), output level meter
+  typing.rs          typing test: words, scoring, personal bests
+  solar.rs           solar system simulation, word → material harvest, save file
+  greek.rs           Greek letter map (SMath / Symbol-font keys)
   sysinfo.rs         top bar readings (CPU, RAM, GPU, temps, battery, network, disk)
   providers/         ── result sources ("plugins")
     mod.rs           Provider trait, Item, Action, Registry
@@ -234,7 +266,9 @@ src/
     paint.rs         launcher rendering
     settings.rs      Settings window (custom-drawn controls, hotkey recorder)
     draw.rs          shared GDI primitives, anti-aliased shapes, fonts
-    fidget.rs        fidget mode: shake detection, particle physics, click-through overlay
+    fidget.rs        fidget mode (shake detection, particle physics) and the shared click-through overlay
+    solar.rs         Solar System on the desktop: particle-clump planets, pixel interface, launcher star
+    pixfont.rs       5×7 pixel font for the Solar System
     picker.rs        screen colour picker (click-catching layer + loupe)
     theme.rs         colours, accents, layout metrics
     icons.rs         icon bitmap cache
@@ -265,7 +299,7 @@ The UI renders any `Item` (title, subtitle, accessory label, app icon or Fluent 
 - [x] Self-updating from GitHub Releases (0.2 “Euler”)
 - [x] Draggable launcher and fidget mode (shake it to dissolve the letters into orbiting pixels)
 - [x] File search, colour picker, top bar, appearance customisation, modules (0.3 “Charpy”)
-- [ ] Spotify controls in the top bar
+- [x] Now Playing (Spotify and any media player) in the top bar, Greek letter hotkey, typing test, Solar System (0.4 “Newton”)
 - [ ] Google search fallback ("Search Google for …")
 - [ ] Ask AI (inline answer view)
 - [ ] Actions panel (`Ctrl+K`): run as admin, open file location, copy path

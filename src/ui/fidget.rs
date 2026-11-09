@@ -14,7 +14,6 @@
 //!   frame touches a fraction of the screen.
 //! - Nothing exists until fidget mode starts, and all of it is freed when it ends.
 
-use std::cell::Cell;
 use std::time::Instant;
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -469,7 +468,8 @@ impl Palette {
 }
 
 /// Transparent colour of the overlay (identical in COLORREF and DIB order).
-const KEY: u32 = 0x0001_0001;
+/// The see-through colour of overlays.
+pub const KEY: u32 = 0x0001_0001;
 
 fn to_dib(c: COLORREF) -> u32 {
     let (r, g, b) = (c.0 & 0xFF, (c.0 >> 8) & 0xFF, (c.0 >> 16) & 0xFF);
@@ -664,35 +664,29 @@ impl Drop for Pacer {
 /// Cells per tile when finding what changed between frames.
 const TILE: usize = 16;
 
-thread_local! {
-    /// The overlay was repainted by the system; redraw all of it next frame.
-    static FULL_REDRAW: Cell<bool> = const { Cell::new(false) };
-}
-
-pub struct Fidget {
-    hwnd: HWND,
+/// A click-through, colour-keyed layer over a whole monitor, drawn as a grid
+/// of `cell`-px pixels. Only tiles that changed since the last frame are
+/// copied to the screen. Shared by fidget mode, the Solar System and the
+/// typing-test harvest.
+pub struct Overlay {
+    pub hwnd: HWND,
     /// Monitor origin (physical screen px).
-    left: i32,
-    top: i32,
-    unit: f32,
-    cell: i32,
-    gw: usize,
-    gh: usize,
+    pub left: i32,
+    pub top: i32,
+    pub cell: i32,
+    pub gw: usize,
+    pub gh: usize,
     dc: HDC,
     bmp: HBITMAP,
     old: HGDIOBJ,
     bits: *mut u32,
     prev: Vec<u32>,
     first: bool,
-    pub sim: Sim,
-    palette: Palette,
-    last_tick: Instant,
 }
 
-impl Fidget {
-    /// Opens the overlay over `monitor` (physical px). `unit` is physical px
-    /// per logical px; `sources` are the colours of search text and placeholder.
-    pub fn start(owner: HWND, monitor: RECT, unit: f32, sources: [COLORREF; 2], accent: COLORREF) -> Option<Box<Self>> {
+impl Overlay {
+    /// Opens the layer over `monitor` (physical px), with pixels `cell` px wide.
+    pub fn new(owner: Option<HWND>, monitor: RECT, cell: i32) -> Option<Self> {
         let (mw, mh) = (monitor.right - monitor.left, monitor.bottom - monitor.top);
         if mw <= 0 || mh <= 0 {
             return None;
@@ -700,7 +694,7 @@ impl Fidget {
         // One px short of the full height, so Windows doesn't treat the
         // overlay as a full-screen app (that would hide the taskbar).
         let mh = mh - 1;
-        let cell = ((CELL * unit).round() as i32).max(2);
+        let cell = cell.max(1);
         let (gw, gh) = ((mw + cell - 1) / cell, (mh + cell - 1) / cell);
         unsafe {
             register_class();
@@ -714,7 +708,7 @@ impl Fidget {
                 monitor.top,
                 mw,
                 mh,
-                Some(owner),
+                owner,
                 None,
                 Some(hinst.into()),
                 None,
@@ -736,11 +730,11 @@ impl Fidget {
             let old = SelectObject(dc, bmp.into());
             let n = (gw * gh) as usize;
             std::slice::from_raw_parts_mut(bits as *mut u32, n).fill(KEY);
-            let me = Box::new(Self {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            Some(Self {
                 hwnd,
                 left: monitor.left,
                 top: monitor.top,
-                unit,
                 cell,
                 gw: gw as usize,
                 gh: gh as usize,
@@ -750,61 +744,24 @@ impl Fidget {
                 bits: bits as *mut u32,
                 prev: vec![KEY; n],
                 first: true,
-                sim: Sim::new(mw as f32 / unit, mh as f32 / unit),
-                palette: Palette::new(sources, accent),
-                last_tick: Instant::now(),
-            });
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            Some(me)
+            })
         }
     }
 
-    /// Screen point (physical px) → simulation space (logical px).
-    pub fn to_sim(&self, x: i32, y: i32) -> (f32, f32) {
-        ((x - self.left) as f32 / self.unit, (y - self.top) as f32 / self.unit)
-    }
-
-    /// Turns `text`, drawn with `font` with its top-left at `at` (physical
-    /// screen px), into particles moving at `vel` (logical px/s). Returns the
-    /// text's width in physical px.
-    pub fn dissolve(&mut self, text: &str, font: HFONT, at: POINT, src: u8, vel: (f32, f32)) -> i32 {
-        let Some((cov, tw, th)) = rasterize(text, font) else { return 0 };
-        let (x0, y0) = (at.x - self.left, at.y - self.top);
-        let mut cursor = POINT::default();
-        unsafe {
-            let _ = GetCursorPos(&mut cursor);
-        }
-        let sun = self.to_sim(cursor.x, cursor.y);
-        let c = self.cell as f32;
-        for (gx, gy) in sample_cells(&cov, tw, th, x0, y0, self.cell) {
-            let (x, y) = ((gx as f32 + 0.5) * c / self.unit, (gy as f32 + 0.5) * c / self.unit);
-            self.sim.spawn(x, y, vel.0, vel.1, src, sun);
-        }
-        tw
-    }
-
-    /// Advances the simulation to now and draws the frame.
-    pub fn tick(&mut self, cursor: POINT) {
-        let now = Instant::now();
-        let dt = now.duration_since(self.last_tick).as_secs_f32();
-        self.last_tick = now;
-        let sun = self.to_sim(cursor.x, cursor.y);
-        self.sim.step(dt, sun);
+    /// The pixel grid to draw the next frame into (0x00RRGGBB; `KEY` is see-through).
+    pub fn grid(&mut self) -> &mut [u32] {
         unsafe {
             // The previous frame's blits must finish reading the DIB first.
             let _ = GdiFlush();
+            std::slice::from_raw_parts_mut(self.bits, self.gw * self.gh)
         }
-        let n = self.gw * self.gh;
-        let grid = unsafe { std::slice::from_raw_parts_mut(self.bits, n) };
-        grid.fill(KEY);
-        self.sim.render(grid, self.gw, self.gh, self.unit / self.cell as f32, &self.palette);
-        self.present();
     }
 
     /// Copies the tiles that changed (all of them after a system repaint)
-    /// onto the overlay.
-    fn present(&mut self) {
-        let full = FULL_REDRAW.with(|f| f.replace(false)) || std::mem::take(&mut self.first);
+    /// onto the screen.
+    pub fn present(&mut self) {
+        let repainted = unsafe { SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0) } != 0;
+        let full = repainted || std::mem::take(&mut self.first);
         let (gw, gh) = (self.gw, self.gh);
         let grid = unsafe { std::slice::from_raw_parts(self.bits, gw * gh) };
         let (tx_n, ty_n) = (gw.div_ceil(TILE), gh.div_ceil(TILE));
@@ -852,9 +809,15 @@ impl Fidget {
         }
         self.prev.copy_from_slice(grid);
     }
+
+    /// Lit (non-transparent) pixels in the current grid.
+    #[cfg(test)]
+    pub fn lit(&self) -> usize {
+        unsafe { std::slice::from_raw_parts(self.bits, self.gw * self.gh) }.iter().filter(|&&c| c != KEY).count()
+    }
 }
 
-impl Drop for Fidget {
+impl Drop for Overlay {
     fn drop(&mut self) {
         unsafe {
             let _ = DestroyWindow(self.hwnd);
@@ -862,6 +825,70 @@ impl Drop for Fidget {
             let _ = DeleteObject(self.bmp.into());
             let _ = DeleteDC(self.dc);
         }
+    }
+}
+
+pub struct Fidget {
+    ov: Overlay,
+    unit: f32,
+    pub sim: Sim,
+    palette: Palette,
+    last_tick: Instant,
+}
+
+impl Fidget {
+    /// Opens the overlay over `monitor` (physical px). `unit` is physical px
+    /// per logical px; `sources` are the colours of search text and placeholder.
+    pub fn start(owner: HWND, monitor: RECT, unit: f32, sources: [COLORREF; 2], accent: COLORREF) -> Option<Box<Self>> {
+        let cell = ((CELL * unit).round() as i32).max(2);
+        let ov = Overlay::new(Some(owner), monitor, cell)?;
+        let (mw, mh) = (monitor.right - monitor.left, monitor.bottom - monitor.top - 1);
+        Some(Box::new(Self {
+            ov,
+            unit,
+            sim: Sim::new(mw as f32 / unit, mh as f32 / unit),
+            palette: Palette::new(sources, accent),
+            last_tick: Instant::now(),
+        }))
+    }
+
+    /// Screen point (physical px) → simulation space (logical px).
+    pub fn to_sim(&self, x: i32, y: i32) -> (f32, f32) {
+        ((x - self.ov.left) as f32 / self.unit, (y - self.ov.top) as f32 / self.unit)
+    }
+
+    /// Turns `text`, drawn with `font` with its top-left at `at` (physical
+    /// screen px), into particles moving at `vel` (logical px/s). Returns the
+    /// text's width in physical px.
+    pub fn dissolve(&mut self, text: &str, font: HFONT, at: POINT, src: u8, vel: (f32, f32)) -> i32 {
+        let Some((cov, tw, th)) = rasterize(text, font) else { return 0 };
+        let (x0, y0) = (at.x - self.ov.left, at.y - self.ov.top);
+        let mut cursor = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut cursor);
+        }
+        let sun = self.to_sim(cursor.x, cursor.y);
+        let c = self.ov.cell as f32;
+        for (gx, gy) in sample_cells(&cov, tw, th, x0, y0, self.ov.cell) {
+            let (x, y) = ((gx as f32 + 0.5) * c / self.unit, (gy as f32 + 0.5) * c / self.unit);
+            self.sim.spawn(x, y, vel.0, vel.1, src, sun);
+        }
+        tw
+    }
+
+    /// Advances the simulation to now and draws the frame.
+    pub fn tick(&mut self, cursor: POINT) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_tick).as_secs_f32();
+        self.last_tick = now;
+        let sun = self.to_sim(cursor.x, cursor.y);
+        self.sim.step(dt, sun);
+        let (gw, gh) = (self.ov.gw, self.ov.gh);
+        let scale = self.unit / self.ov.cell as f32;
+        let grid = self.ov.grid();
+        grid.fill(KEY);
+        self.sim.render(grid, gw, gh, scale, &self.palette);
+        self.ov.present();
     }
 }
 
@@ -891,7 +918,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             let mut ps = PAINTSTRUCT::default();
             BeginPaint(hwnd, &mut ps);
             let _ = EndPaint(hwnd, &ps);
-            FULL_REDRAW.with(|f| f.set(true));
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 1);
             LRESULT(0)
         },
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
@@ -1083,13 +1110,13 @@ mod tests {
                     f.tick(POINT { x: ((600.0 + i as f32) * unit) as i32, y: (400.0 * unit) as i32 });
                 }
                 let per = t0.elapsed().as_secs_f64() * 1000.0 / frames as f64 - 1.0;
-                let drawn = std::slice::from_raw_parts(f.bits, f.gw * f.gh).iter().filter(|&&c| c != KEY).count();
+                let drawn = f.ov.lit();
                 println!(
                     "{label}: {letters} letter pixels, cell {} px, grid {}x{} ({} KB), {drawn} cells lit, {per:.2} ms/frame with {} particles",
-                    f.cell,
-                    f.gw,
-                    f.gh,
-                    f.gw * f.gh * 8 / 1024,
+                    f.ov.cell,
+                    f.ov.gw,
+                    f.ov.gh,
+                    f.ov.gw * f.ov.gh * 8 / 1024,
                     f.sim.particles.len()
                 );
                 assert!(drawn > 500);

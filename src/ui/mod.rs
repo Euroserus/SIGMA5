@@ -9,7 +9,9 @@ pub mod input;
 pub mod installer;
 pub mod paint;
 pub mod picker;
+pub mod pixfont;
 pub mod settings;
+pub mod solar;
 pub mod theme;
 pub mod tray;
 pub mod window;
@@ -88,3 +90,14 @@ pub const WM_APP_FILES: u32 = WM_APP + 26;
 pub const WM_APP_COLOR_PICKED: u32 = WM_APP + 27;
 /// Top bar readings: LPARAM = Box<sysinfo::Snapshot>.
 pub const WM_APP_SYSINFO: u32 = WM_APP + 28;
+/// Now playing changed: LPARAM = Box<Option<media::NowPlaying>>.
+pub const WM_APP_MEDIA: u32 = WM_APP + 29;
+/// A key typed on the Typing Test page: WPARAM = UTF-16 code unit
+/// (8 = Backspace, 0x7F = Ctrl+Backspace).
+pub const WM_APP_TYPE_CHAR: u32 = WM_APP + 30;
+/// The Solar System window asks for the Typing Test.
+pub const WM_APP_OPEN_TYPING: u32 = WM_APP + 31;
+/// Show the Typing Test length menu: LPARAM = screen point (x, y as i16 pair).
+pub const WM_APP_TYPING_MENU: u32 = WM_APP + 32;
+/// The launcher's orbiting star was clicked: LPARAM = its screen centre (x, y as i16 pair).
+pub const WM_APP_OPEN_SOLAR: u32 = WM_APP + 33;

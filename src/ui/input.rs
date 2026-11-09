@@ -13,6 +13,10 @@
 //! 4. **Taken-over hotkeys**: SIGMA5 hotkeys that another app has already
 //!    registered (so `RegisterHotKey` refuses them) are recognised here, before
 //!    Windows dispatches hotkeys, swallowed, and delivered as `WM_HOTKEY`.
+//! 5. **Greek letters**: the last letter typed is remembered (a mouse click,
+//!    or any other key, forgets it). The Greek hotkey swallows itself and,
+//!    once every modifier is released, replaces that letter with its Greek
+//!    twin by injecting Backspace and the Unicode character.
 //!
 //! The hook thread only exists while one of these is needed. Our own injected
 //! events are ignored by the hook, so remaps never loop.
@@ -33,13 +37,13 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, HHOOK,
     KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, MSG, PM_NOREMOVE, PeekMessageW, PostMessageW,
-    PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN,
-    WM_QUIT, WM_SYSKEYDOWN, WM_USER,
+    PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_QUIT, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_USER, WM_XBUTTONDOWN,
 };
 
 use super::{WM_APP_CAPTURE_MODS, WM_APP_CAPTURED, WM_APP_WINKEY};
@@ -62,6 +66,8 @@ pub struct Rules {
     pub remaps: Vec<(u32, Target)>,
     /// Hotkeys to take over: (modifier bits, key code, WM_HOTKEY id).
     pub hotkeys: Vec<(u8, u32, i32)>,
+    /// The Greek-letter hotkey: (modifier bits, key code).
+    pub greek: Option<(u8, u32)>,
 }
 
 impl Rules {
@@ -69,7 +75,7 @@ impl Rules {
         self.remaps.iter().find(|(c, _)| *c == code).map(|(_, t)| *t)
     }
     fn is_empty(&self) -> bool {
-        !self.win_tap && self.remaps.is_empty() && self.hotkeys.is_empty()
+        !self.win_tap && self.remaps.is_empty() && self.hotkeys.is_empty() && self.greek.is_none()
     }
 }
 
@@ -164,15 +170,33 @@ fn update_thread() {
             let hook: Option<HHOOK> = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), hinst, 0).ok();
             let _ = tx.send(if hook.is_some() { GetCurrentThreadId() } else { 0 });
             let Some(hook) = hook else { return };
+            // The mouse hook (only for the Greek hotkey) forgets the last
+            // letter on a click, since the caret has probably moved.
+            let mut mouse: Option<HHOOK> = None;
+            let sync_mouse = |mouse: &mut Option<HHOOK>| {
+                let want = current_rules().greek.is_some();
+                if want && mouse.is_none() {
+                    *mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), hinst, 0).ok();
+                } else if !want {
+                    if let Some(m) = mouse.take() {
+                        let _ = UnhookWindowsHookEx(m);
+                    }
+                }
+            };
+            sync_mouse(&mut mouse);
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
                 if msg.hwnd.is_invalid() && msg.message == MSG_RELEASE_ALL {
                     STATE.with(|s| s.borrow_mut().release_all());
+                    sync_mouse(&mut mouse);
                     continue;
                 }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
             STATE.with(|s| s.borrow_mut().release_all());
+            if let Some(m) = mouse {
+                let _ = UnhookWindowsHookEx(m);
+            }
             let _ = UnhookWindowsHookEx(hook);
         });
         if spawned.is_ok() {
@@ -378,13 +402,94 @@ struct HookState {
     capture_owner: isize,
     /// Key of a taken-over hotkey that is down (its repeats and release are swallowed too).
     hot_key: Option<u32>,
+    /// Last letter typed and the window it went to (for the Greek hotkey).
+    letter: Option<(char, isize)>,
+    /// Greek hotkey key that is down.
+    greek_key: Option<u32>,
+    /// Swap waiting for the modifiers to be released: (replacement, window).
+    greek_pending: Option<(char, isize)>,
 }
 
 impl HookState {
     fn release_all(&mut self) {
         let out = self.remap.release_all();
         inject(&out);
+        self.greek_pending = None;
     }
+
+    /// The pending Greek swap, if no modifier is left held once `released`
+    /// and the key-ups in `out` have gone through. Consumes it.
+    fn greek_ready(&mut self, released: &[u32], out: &[Out]) -> Option<char> {
+        self.greek_pending?;
+        if self.greek_key.is_some() {
+            return None;
+        }
+        let mut ups: Vec<u32> = released.to_vec();
+        ups.extend(out.iter().filter(|(_, up)| *up).map(|(c, _)| *c));
+        if !mods_clear_after(&ups) {
+            return None;
+        }
+        let (c, w) = self.greek_pending.take()?;
+        if foreground() != w || foreground_is_elevated() {
+            return None;
+        }
+        // Pressing the hotkey again swaps it back.
+        self.letter = Some((c, w));
+        Some(c)
+    }
+}
+
+/// The letter a key types: A-Z with no Ctrl/Alt/Win, cased by Shift and Caps Lock.
+pub fn letter_for(code: u32, mods: u8, caps_on: bool) -> Option<char> {
+    if !(0x41..=0x5A).contains(&code) || mods & (CTRL | ALT | WIN) != 0 {
+        return None;
+    }
+    let c = char::from(code as u8);
+    Some(if (mods & SHIFT != 0) ^ caps_on { c } else { c.to_ascii_lowercase() })
+}
+
+const MOD_VKS: [u32; 8] = [
+    keys::VK_LCONTROL, keys::VK_RCONTROL, keys::VK_LSHIFT, keys::VK_RSHIFT, keys::VK_LMENU, keys::VK_RMENU, keys::VK_LWIN,
+    keys::VK_RWIN,
+];
+
+/// True when no modifier stays held once the keys in `released` are up.
+fn mods_clear_after(released: &[u32]) -> bool {
+    MOD_VKS.iter().all(|&vk| released.contains(&vk) || !key_held(vk))
+}
+
+fn foreground() -> isize {
+    unsafe { GetForegroundWindow() }.0 as isize
+}
+
+/// Backspace over the last letter and type `c` in its place.
+fn send_replacement(c: char) {
+    let mut buf = [0u16; 2];
+    let units = c.encode_utf16(&mut buf);
+    let mut inputs = vec![key_input(0x08, false, false), key_input(0x08, true, false)];
+    for &u in units.iter() {
+        for up in [false, true] {
+            let flags = if up { KEYEVENTF_UNICODE | KEYEVENTF_KEYUP } else { KEYEVENTF_UNICODE };
+            inputs.push(INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0), wScan: u, dwFlags: flags, time: 0, dwExtraInfo: SIGNATURE },
+                },
+            });
+        }
+    }
+    send(&inputs);
+}
+
+unsafe extern "system" fn mouse_proc(ncode: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if ncode >= 0 && matches!(wp.0 as u32, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN) {
+        STATE.with(|s| {
+            if let Ok(mut s) = s.try_borrow_mut() {
+                s.letter = None;
+            }
+        });
+    }
+    unsafe { CallNextHookEx(None, ncode, wp, lp) }
 }
 
 thread_local! {
@@ -528,12 +633,48 @@ fn handle(k: &KBDLLHOOKSTRUCT, is_down: bool) -> bool {
         // 3. Remaps.
         if let Some(target) = rules.lookup(code) {
             let out = s.remap.event(code, target, is_down);
+            let as_mods = matches!(target, Target::Keys { key: None, .. });
+            if is_down && !as_mods {
+                s.letter = None;
+            }
+            let fire = if is_down { None } else { s.greek_ready(&[code], &out) };
             drop(s);
             inject(&out);
+            if let Some(c) = fire {
+                send_replacement(c);
+            }
             return true;
         }
         if is_down {
             s.remap.note_other_key(code);
+        }
+
+        // Greek hotkey: swallowed; the swap happens once the modifiers are up.
+        if let Some((gm, gk)) = rules.greek {
+            if s.greek_key == Some(code) {
+                if !is_down {
+                    s.greek_key = None;
+                    let fire = s.greek_ready(&[code], &[]);
+                    drop(s);
+                    if let Some(c) = fire {
+                        send_replacement(c);
+                    }
+                }
+                return true;
+            }
+            let held = held_mods();
+            if is_down && keys::vk(code) as u32 == gk && held == gm {
+                s.greek_key = Some(code);
+                if held & (WIN | ALT) != 0 {
+                    send(&[key_input(MASK_VK, false, false), key_input(MASK_VK, true, false)]);
+                }
+                let fg = foreground();
+                s.greek_pending = match s.letter {
+                    Some((c, w)) if w == fg => crate::greek::toggle(c).map(|g| (g, fg)),
+                    _ => None,
+                };
+                return true;
+            }
         }
 
         // 4. Taken-over hotkeys.
@@ -547,6 +688,7 @@ fn handle(k: &KBDLLHOOKSTRUCT, is_down: bool) -> bool {
             let held = held_mods();
             if let Some(id) = match_hotkey(&rules.hotkeys, code, held) {
                 s.hot_key = Some(code);
+                s.letter = None;
                 drop(s);
                 // With Win or Alt held, a key the shell sees between their
                 // press and release stops Start or a menu bar from opening.
@@ -557,7 +699,21 @@ fn handle(k: &KBDLLHOOKSTRUCT, is_down: bool) -> bool {
                 return true;
             }
         }
+
+        // Letters typed, for the Greek hotkey.
+        let mut fire = None;
+        if rules.greek.is_some() {
+            if is_down && !keys::is_modifier(code) {
+                let caps = unsafe { GetKeyState(keys::VK_CAPITAL as i32) } & 1 != 0;
+                s.letter = letter_for(code, held_mods(), caps).map(|c| (c, foreground()));
+            } else if !is_down && keys::is_modifier(code) {
+                fire = s.greek_ready(&[code], &[]);
+            }
+        }
         drop(s);
+        if let Some(c) = fire {
+            send_replacement(c);
+        }
 
         // 5. Windows key → SIGMA5.
         if verdict == Verdict::Tap && rules.win_tap && !foreground_is_elevated() {
@@ -684,6 +840,18 @@ mod tests {
         assert_eq!(match_hotkey(&hk, 0x43, WIN | SHIFT | CTRL), None);
         assert_eq!(match_hotkey(&hk, 0x50, CTRL | ALT | SHIFT), Some(101));
         assert_eq!(match_hotkey(&hk, 0x44, WIN | SHIFT), None);
+    }
+
+    #[test]
+    fn letters_for_the_greek_hotkey() {
+        assert_eq!(letter_for(0x54, 0, false), Some('t'));
+        assert_eq!(letter_for(0x54, SHIFT, false), Some('T'));
+        assert_eq!(letter_for(0x54, 0, true), Some('T'));
+        assert_eq!(letter_for(0x54, SHIFT, true), Some('t'));
+        assert_eq!(letter_for(0x54, CTRL, false), None);
+        assert_eq!(letter_for(0x54, keys::HYPER, false), None);
+        assert_eq!(letter_for(0x31, 0, false), None);
+        assert!(!Rules { greek: Some((keys::HYPER, 0x47)), ..Rules::default() }.is_empty());
     }
 
     #[test]
