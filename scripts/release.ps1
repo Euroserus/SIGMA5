@@ -25,10 +25,13 @@ if (git tag --list $tag) { throw "Tag $tag already exists. Bump the version in C
 if (git status --porcelain) { throw "Commit your changes before releasing." }
 if (-not (Test-Path $Notes)) { throw "Notes file '$Notes' not found." }
 
+# A plain version number (not "-dev"): see build.rs.
+$env:SIGMA5_RELEASE = "1"
 cargo test --release
 if ($LASTEXITCODE) { throw "Tests failed." }
 cargo build --release
 if ($LASTEXITCODE) { throw "Build failed." }
+Remove-Item Env:SIGMA5_RELEASE
 
 $exe = "target/release/sigma5.exe"
 $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()

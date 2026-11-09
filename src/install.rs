@@ -23,7 +23,8 @@ use windows::core::{Interface, PCWSTR, w};
 
 use crate::util::wide;
 
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// "0.3.0" for published releases, "0.3.0-dev" for any other build (see build.rs).
+pub const VERSION: &str = env!("SIGMA5_VERSION");
 /// Each release is named after a famous engineer or researcher.
 pub const CODENAME: &str = "Charpy";
 
@@ -69,9 +70,16 @@ pub fn autostart_exe() -> PathBuf {
     if is_installed() { installed_exe() } else { std::env::current_exe().unwrap_or_else(|_| installed_exe()) }
 }
 
-pub fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
-    let mut it = s.trim().trim_start_matches('v').split('.').map(|p| p.parse::<u32>().ok());
-    Some((it.next()??, it.next().flatten().unwrap_or(0), it.next().flatten().unwrap_or(0)))
+/// (major, minor, patch, is_release). A suffix such as "-dev" marks a
+/// pre-release, which sorts below the release with the same number.
+pub fn parse_version(s: &str) -> Option<(u32, u32, u32, u32)> {
+    let s = s.trim().trim_start_matches('v');
+    let (num, pre) = match s.split_once('-') {
+        Some((n, _)) => (n, true),
+        None => (s, false),
+    };
+    let mut it = num.split('.').map(|p| p.parse::<u32>().ok());
+    Some((it.next()??, it.next().flatten().unwrap_or(0), it.next().flatten().unwrap_or(0), !pre as u32))
 }
 
 /// Version recorded by the installed copy (from its Apps entry).
@@ -284,10 +292,14 @@ mod tests {
 
     #[test]
     fn versions() {
-        assert_eq!(parse_version("0.2.0"), Some((0, 2, 0)));
-        assert_eq!(parse_version("v1.10"), Some((1, 10, 0)));
+        assert_eq!(parse_version("0.2.0"), Some((0, 2, 0, 1)));
+        assert_eq!(parse_version("v1.10"), Some((1, 10, 0, 1)));
         assert!(parse_version("0.10.0") > parse_version("0.9.9"));
         assert_eq!(parse_version("x"), None);
+        // A dev build is older than its release, newer than the one before.
+        assert_eq!(parse_version("0.3.0-dev"), Some((0, 3, 0, 0)));
+        assert!(parse_version("0.3.0") > parse_version("0.3.0-dev"));
+        assert!(parse_version("0.3.0-dev") > parse_version("0.2.2"));
     }
 
     #[test]
@@ -302,5 +314,9 @@ mod tests {
         assert_eq!(decide(false, false, Some("0.1.0"), "0.2.0"), Installer { update: true });
         assert_eq!(decide(false, false, Some("0.2.0"), "0.2.0"), Normal);
         assert_eq!(decide(false, false, Some("0.3.0"), "0.2.0"), Normal);
+        // A dev build doesn't install itself over the release it's based on...
+        assert_eq!(decide(false, false, Some("0.3.0"), "0.3.0-dev"), Normal);
+        // ...but a newer one can still be installed for testing.
+        assert_eq!(decide(false, false, Some("0.3.0"), "0.3.1-dev"), Installer { update: true });
     }
 }

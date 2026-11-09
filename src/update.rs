@@ -298,6 +298,11 @@ mod tests {
     }
 
     #[test]
+    fn release_replaces_its_dev_build() {
+        assert_eq!(parse_latest(SAMPLE, "0.3.0-dev").unwrap().unwrap().version, "0.3.0");
+    }
+
+    #[test]
     fn same_or_older_is_not() {
         assert_eq!(parse_latest(SAMPLE, "0.3.0").unwrap(), None);
         assert_eq!(parse_latest(SAMPLE, "0.4.1").unwrap(), None);
